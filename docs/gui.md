@@ -46,8 +46,13 @@ cargo run -p aneural-gui --features dev -- <directory>     # omit the path to ge
   the work this is here to watch must not be slowed by the watching. `gui.live`, `gui.portals` (0 keeps
   the glow and the top-bar count) and `gui.livePace` (`auto` | `eager` | `calm` | `off`) tune it;
   `false` is the app as it was, pixel for pixel.
-- **Layout**: force-directed on `FixedUpdate` — repulsion, springs per edge kind, gravity toward the
-  CONTAINS parent, damping, energy-based freeze. Drag pins a node.
+- **Layout** (`layout.rs`): computed, not simulated. Each folder is a disc holding its own node, a
+  head of its files and a disc per subfolder, packed outward from the root so branches never cross;
+  the simulation only eases nodes to their places. Once a workspace has grown in, the canvas is
+  rearranged only when asked (`Space`, or opening another workspace): what was placed keeps its
+  place and only new growth is seated. While it is *first* growing in, every batch is laid out
+  from nothing instead, so the finished shape does not depend on the order things arrived in and
+  the root ends up in the middle. Dragging a node moves its branch.
 - **Panels** (egui): filters (kinds, edge kinds, repos, search, focus mode + depth), inspector (props,
   edges, pins, notes for the assistant, open in editor), status bar. The
   **marketplace** is an `egui::Modal` opened from the top bar, not a docked panel: `ee00a1c` removed

@@ -10,7 +10,7 @@
 //! everything they touch. The simulation only eases nodes to their places and
 //! nudges apart any that would land on top of each other.
 
-use crate::engine::IndexStatus;
+use crate::engine::{IndexStatus, PendingDeltas};
 use crate::graph::{GraphNode, GraphState, Hidden, Pinned, Pos, Vel, hash01};
 use aneural_core::NodeId;
 use bevy::prelude::*;
@@ -532,6 +532,9 @@ struct Plan {
     places: Vec<(Entity, Option<Entity>, Vec2)>,
     /// Where this plan put everything, so the next one leaves it there.
     settled: Settled,
+    /// Whether the workspace has finished growing in. Until it has, nothing
+    /// that was settled is kept: see [`step`].
+    grown: bool,
 }
 
 /// A number that changes when the set of nodes does: each id hashed, and the
@@ -551,6 +554,7 @@ fn node_set(graph: &GraphState) -> u64 {
 fn step(
     mut params: ResMut<LayoutParams>,
     status: Res<IndexStatus>,
+    pending: Res<PendingDeltas>,
     graph: Res<GraphState>,
     mut plan: Local<Plan>,
     mut nodes: Query<(Entity, &mut Pos, &mut Vel, Has<Pinned>, Has<Hidden>), With<GraphNode>>,
@@ -558,12 +562,25 @@ fn step(
     let afresh = std::mem::take(&mut params.afresh);
     if afresh {
         plan.settled = Settled::default();
+        plan.grown = false;
     }
     if afresh || status.generation != params.last_generation {
         params.last_generation = status.generation;
         let shape = (node_set(&graph), graph.edge_count);
         if afresh || plan.shape != shape {
             plan.shape = shape;
+            // A workspace arrives a couple of hundred nodes a frame, and each
+            // batch is planned. Keeping what the last batch settled would make
+            // the finished shape a record of the order things turned up in:
+            // the first folders take the middle, everything later is pushed
+            // out along whatever bearing it happened to get, and the root ends
+            // up in a corner with its strands drawn across every cluster.
+            // Nobody has arranged a view of a graph that is still appearing,
+            // so until it has all arrived each plan starts from nothing, and
+            // the last of them is the shape `Space` would have given.
+            if !plan.grown {
+                plan.settled = Settled::default();
+            }
             let ids: Vec<NodeId> = graph.by_id.keys().cloned().collect();
             let neighbors =
                 |id: &NodeId| graph.neighbors(id).iter().map(|(n, _)| n.clone()).collect();
@@ -582,6 +599,12 @@ fn step(
             // every time a file is saved would only make it flinch.
             params.nudge();
         }
+    }
+    // Checked after planning, so the batch that completes the graph is still
+    // laid out from nothing. `complete` alone is not enough: the engine says so
+    // while most of what it sent is still queued behind the growth budget.
+    if status.complete && pending.0.is_empty() {
+        plan.grown = true;
     }
     if params.frozen {
         return;
