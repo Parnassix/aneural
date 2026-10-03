@@ -53,6 +53,9 @@ cargo run -p aneural-gui --features dev -- <directory>     # omit the path to ge
   place and only new growth is seated. While it is *first* growing in, every batch is laid out
   from nothing instead, so the finished shape does not depend on the order things arrived in and
   the root ends up in the middle. Dragging a node moves its branch.
+- **Window placement** (`placement.rs`): which monitor the window opens on and whether it fills it,
+  read from `~/.config/aneural/window.json` — a per-user file, never the workspace's. See the
+  README.
 - **Panels** (egui): filters (kinds, edge kinds, repos, search, focus mode + depth), inspector (props,
   edges, pins, notes for the assistant, open in editor), status bar. The
   **marketplace** is an `egui::Modal` opened from the top bar, not a docked panel: `ee00a1c` removed

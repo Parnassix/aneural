@@ -13,6 +13,7 @@ mod live;
 mod markdown;
 mod marketplace;
 mod picking;
+mod placement;
 mod render;
 mod review;
 mod switch;
@@ -80,6 +81,7 @@ fn main() {
             ui::UiPlugin,
             focus::FocusPlugin,
             switch::SwitchPlugin,
+            placement::PlacementPlugin,
             marketplace::MarketplacePlugin,
         ))
         .add_systems(

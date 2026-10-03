@@ -20,19 +20,23 @@ const RECENT_LIMIT: usize = 8;
 #[derive(Resource, Default)]
 pub struct OpenRequest(pub Option<PathBuf>);
 
+/// What belongs to the user rather than to any one workspace: kept in their
+/// config directory, never in a `.aneural/`.
+pub(crate) fn user_config_dir() -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(config.join("aneural"))
+}
+
 /// Workspaces opened before, most recent first. Shared by every window of the
 /// app, so it lives beside the user's home rather than in any one workspace.
 #[derive(Resource, Default)]
 pub struct Recents(pub Vec<PathBuf>);
 
 impl Recents {
-    /// Kept in the user's config directory rather than in a `.aneural/`, which
-    /// always belongs to one particular workspace.
     fn path() -> Option<PathBuf> {
-        let config = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-        Some(config.join("aneural").join("recent.json"))
+        Some(user_config_dir()?.join("recent.json"))
     }
 
     fn load() -> Self {
