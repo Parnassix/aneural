@@ -34,7 +34,10 @@ function resolveRoot(cmd: Command, required = true): string {
   return process.cwd();
 }
 
-const MCP_SERVER_ENTRY = { command: 'npx', args: ['-y', 'aneural', 'mcp'] };
+// The CLI on PATH, never `npx -y aneural`: until the package is published under
+// a name this project owns, npx would fetch and run whatever anyone uploads as
+// "aneural", from a file that is usually committed.
+const MCP_SERVER_ENTRY = { command: 'aneural', args: ['mcp'] };
 
 function writeMcpJson(dir: string): string {
   const file = path.join(dir, '.mcp.json');
@@ -82,7 +85,7 @@ program
       }
       if (opts.codex) {
         process.stdout.write(
-          `\nAdd to ~/.codex/config.toml:\n\n[mcp_servers.aneural]\ncommand = "npx"\nargs = ["-y", "aneural", "mcp"]\n\n`,
+          `\nAdd to ~/.codex/config.toml:\n\n[mcp_servers.aneural]\ncommand = "aneural"\nargs = ["mcp"]\n\n`,
         );
       }
       process.stdout.write(`${c.dim('next:')} aneural index\n`);
@@ -409,9 +412,7 @@ function renderPlan(plan: core.InstallPlan): string {
       lines.push(`  · ${setting.key}  ${have}${hint}`);
       if (setting.description) lines.push(`      ${c.dim(setting.description)}`);
     }
-    lines.push(
-      c.dim(`  aneural spores set ${plan.id} <key> <value>`),
-    );
+    lines.push(c.dim(`  aneural spores set ${plan.id} <key> <value>`));
   }
   if (plan.missingSecrets?.length) {
     lines.push('');
@@ -514,9 +515,7 @@ spores
     );
     const still = core.listSpores(root).find((s) => s.id === known.id);
     if (still?.missingSettings?.length) {
-      process.stdout.write(
-        `${c.yellow('still needed')} ${still.missingSettings.join(', ')}\n`,
-      );
+      process.stdout.write(`${c.yellow('still needed')} ${still.missingSettings.join(', ')}\n`);
     }
   });
 
@@ -653,7 +652,7 @@ spores
       process.stdout.write(`${c.green('created')} ${opts.publisher}.${name} in ${target}\n`);
       for (const rel of Object.keys(files)) process.stdout.write(`  ${c.dim(rel)}\n`);
       process.stdout.write(`  ${c.dim('fixtures/expected.json')}\n`);
-      process.stdout.write(`\nnext: ${c.bold('aneural spores test ' + (dir ?? '.'))}\n`);
+      process.stdout.write(`\nnext: ${c.bold(`aneural spores test ${dir ?? '.'}`)}\n`);
     },
   );
 

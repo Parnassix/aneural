@@ -11,7 +11,7 @@ targets:
 
 ## Context
 
-`/Users/joey/Code/Aneural` is an empty directory. It becomes the monorepo for **Aneural**: a fungi-branded ("aneural organisms") tool for keeping visibility and context over everything in a directory while vibe-coding with Claude Code or Codex. The pieces:
+This repository starts as an empty directory. It becomes the monorepo for **Aneural**: a fungi-branded ("aneural organisms") tool for keeping visibility and context over everything in a directory while vibe-coding with Claude Code or Codex. The pieces:
 
 - **GUI** (Rust + Bevy, downloadable): opens any directory (may span many repos) and renders it as a 2D mycelium-styled node graph. Nodes = directories, files, repos, manifests, packages, and spore-derived nodes; edges are typed and named (Neo4j-style). The graph grows live as files change.
 - **CLI** (`aneural`, TypeScript on npm): `aneural init` creates an Obsidian-style `.aneural/` directory (config, custom node types, notes/plans that can live above repo level), plus `index`, `spores`, `mcp`, `doctor`.
@@ -20,8 +20,6 @@ targets:
 - **Node icons** come from the `icondata` crate family.
 
 Decisions already made with the user: full platform skeleton first; TypeScript CLI + MCP, Rust GUI; **one indexer in Rust, exposed to TS via a napi-rs addon (`@aneural/core`)**; analyzers for TS/JS, Python, Rust, Go, Java, PHP, Ruby (TS/JS fully resolved, others extraction + best-effort resolution); 2D graph with dimension-agnostic layout math.
-
-Prior "aneural-frontend" sessions were a different product (renamed Parnassix); nothing carries over.
 
 ## Environment facts
 

@@ -54,7 +54,7 @@ describe('aneural cli', () => {
       mcpServers: Record<string, { command: string; args?: string[] }>;
     };
     expect(mcp.mcpServers.other?.command).toBe('x');
-    expect(mcp.mcpServers.aneural?.args).toEqual(['-y', 'aneural', 'mcp']);
+    expect(mcp.mcpServers.aneural?.args).toEqual(['mcp']);
     expect(run(['init', root], { expectFail: true }).code).not.toBe(0);
   });
 

@@ -149,10 +149,7 @@ impl Workspace {
             ..Config::default()
         };
         self.save_config(&config)?;
-        let gi = dir.join(".gitignore");
-        if !gi.exists() {
-            std::fs::write(&gi, "cache/\nstate/\n")?;
-        }
+        self.ensure_ignored()?;
         write_gitattributes(&self.gitattributes_path())?;
         let icebox = self.icebox_dir().join("ideas.md");
         if !icebox.exists() {
@@ -162,6 +159,23 @@ impl Workspace {
             )?;
         }
         Ok(config)
+    }
+
+    /// Keep what is derived out of version control.
+    ///
+    /// `init` is not the only way in: the GUI can be pointed at any directory,
+    /// and the first thing it does there is build a cache and write a focus.
+    /// Without this rule a `git add -A` in that directory commits an index
+    /// database and whatever the focus held, so everything that creates
+    /// `cache/` or `state/` calls this first. A file that already exists is
+    /// left alone: a workspace may have put its own rules there.
+    pub fn ensure_ignored(&self) -> Result<()> {
+        let gi = self.aneural_dir().join(".gitignore");
+        if !gi.exists() {
+            std::fs::create_dir_all(self.aneural_dir())?;
+            std::fs::write(&gi, "cache/\nstate/\n")?;
+        }
+        Ok(())
     }
 
     pub fn load_config(&self) -> Result<Config> {
@@ -195,6 +209,7 @@ impl Workspace {
     }
 
     pub fn write_focus(&self, focus: &Focus) -> Result<()> {
+        self.ensure_ignored()?;
         std::fs::create_dir_all(self.state_dir())?;
         write_atomic(&self.focus_path(), &serde_json::to_vec_pretty(focus)?)
     }
@@ -363,6 +378,25 @@ mod tests {
             ws.rel(&tmp.canonicalize().unwrap().join("a/b")).as_deref(),
             Some("a/b")
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_directory_nobody_initialised_still_ignores_what_is_derived() {
+        let tmp = std::env::temp_dir().join(format!("aneural-core-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ws = Workspace::at(&tmp);
+        let gi = ws.aneural_dir().join(".gitignore");
+
+        // The GUI's first write into a folder it was merely pointed at.
+        ws.write_focus(&Focus::new(tmp.to_string_lossy())).unwrap();
+        assert_eq!(std::fs::read_to_string(&gi).unwrap(), "cache/\nstate/\n");
+
+        // and a workspace's own rules are never written over
+        std::fs::write(&gi, "cache/\nstate/\nscratch/\n").unwrap();
+        ws.ensure_ignored().unwrap();
+        assert!(std::fs::read_to_string(&gi).unwrap().contains("scratch/"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

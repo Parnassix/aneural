@@ -27,4 +27,5 @@ it does not vet behaviour. Users are told this before every install:
 ## Reporting
 
 Open an issue titled `report: <spore id>`. For anything with a security impact, do
-not open a public issue — email security@aneural.dev.
+not open a public issue — report it privately at
+https://github.com/Parnassix/aneural/security/advisories/new.

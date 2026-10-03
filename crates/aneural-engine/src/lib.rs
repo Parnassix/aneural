@@ -166,6 +166,8 @@ const LAUNCHCTL_FLOOR: Duration = Duration::from_secs(10);
 impl Engine {
     /// Open the engine on a workspace, using the on-disk cache.
     pub fn open(ws: Workspace) -> Result<Self> {
+        // before the cache exists, so it is never there unignored
+        ws.ensure_ignored()?;
         let store = Store::open(&ws.db_path())?;
         Self::with_store(ws, store)
     }

@@ -290,9 +290,7 @@ describe('spores marketplace', () => {
     expect(gh.settings[0]).toMatchObject({ key: 'repo', value: 'acme/widget', required: true });
 
     // It lands in the workspace config, not in a hidden store.
-    const config = JSON.parse(
-      fs.readFileSync(path.join(root, '.aneural', 'config.json'), 'utf8'),
-    );
+    const config = JSON.parse(fs.readFileSync(path.join(root, '.aneural', 'config.json'), 'utf8'));
     expect(config.spores.settings['aneural.github'].repo).toBe('acme/widget');
 
     run(['spores', 'set', 'aneural.github', 'repo']);

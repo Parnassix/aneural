@@ -27,7 +27,7 @@ pub use search::{Hit, search};
 pub use transport::{DirTransport, Fetched, HttpTransport, MixedTransport, Transport};
 
 /// The registry the official first-party spores are published to.
-pub const OFFICIAL_REGISTRY: &str = "https://aneural.dev/registry/index.json";
+pub const OFFICIAL_REGISTRY: &str = aneural_core::config::OFFICIAL_REGISTRY_URL;
 
 /// Shown before every install, in the GUI consent sheet, on the CLI, and in the
 /// docs. Defined once so the three cannot drift apart.
