@@ -195,6 +195,7 @@ pub fn loaded() -> BTreeMap<String, Loaded> {
 }
 
 /// `PID\tStatus\tLabel`, with `-` for either number when there is none.
+#[cfg(any(target_os = "macos", test))]
 fn parse_list(text: &str) -> BTreeMap<String, Loaded> {
     text.lines()
         .skip(1)
