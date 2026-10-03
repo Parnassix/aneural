@@ -7,10 +7,12 @@ use crate::filters::{Filters, PointedKind};
 use crate::focus::FocusState;
 use crate::graph::{GraphEdge, GraphNode, GraphState, Hidden};
 use crate::picking::{Hovered, Selection};
+use crate::review::{self, Review};
 use crate::switch::{OpenRequest, Recents};
 use crate::theme;
 use crate::workspace::WorkspaceRes;
 use aneural_core::NodeId;
+use aneural_core::kinds::EdgeKind;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
@@ -30,6 +32,8 @@ impl Plugin for UiPlugin {
             // contexts claiming `EguiPrimaryContextPass` is a panic.
             .add_systems(PreStartup, own_the_primary_context)
             .init_resource::<PanelsOpen>()
+            .init_resource::<Review>()
+            .add_systems(Update, (review::load, review::frame_step))
             .init_resource::<Styled>()
             .add_systems(
                 EguiPrimaryContextPass,
@@ -283,8 +287,26 @@ fn canvas_cursor(
     });
 }
 
+/// The chrome's own state, bundled because a Bevy system takes at most sixteen
+/// parameters and `panels` was already at the limit. These three belong
+/// together anyway: what is open, what has been asked to open, and the plan
+/// being read in the drawer.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct Chrome<'w, 's> {
+    pub open: ResMut<'w, PanelsOpen>,
+    pub request: ResMut<'w, OpenRequest>,
+    pub review: ResMut<'w, Review>,
+    /// What is happening right now. Carried here rather than as another
+    /// argument because `panels` is already at Bevy's system parameter limit.
+    pub signals: Res<'w, crate::live::Signals>,
+    /// The selection the panels have already answered. Collapsing a drawer is
+    /// a wish about the node you were looking at, not a standing preference,
+    /// so picking a different node brings the drawers back.
+    pub answered: Local<'s, Option<NodeId>>,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn panels(
+pub fn panels(
     mut contexts: EguiContexts,
     ws: Res<WorkspaceRes>,
     status: Res<IndexStatus>,
@@ -294,8 +316,7 @@ fn panels(
     mut focus: ResMut<FocusState>,
     mut frame: ResMut<FrameRequest>,
     mut canvas: ResMut<CanvasRect>,
-    mut open: ResMut<PanelsOpen>,
-    mut open_request: ResMut<OpenRequest>,
+    mut chrome: Chrome,
     mut vibe: ResMut<Vibe>,
     recents: Res<Recents>,
     mut market: ResMut<crate::marketplace::Marketplace>,
@@ -303,6 +324,24 @@ fn panels(
     edges: Query<&GraphEdge>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else { return };
+    // A newly picked node is a question, and the drawers are where it is
+    // answered — so picking one brings back whichever the reader had
+    // collapsed. A plan opens itself for reading: it is the one kind with a
+    // drawer of its own, and hunting for the button to open it after clicking
+    // the node is a step nobody wants twice.
+    if *chrome.answered != selection.primary {
+        chrome.answered.clone_from(&selection.primary);
+        if let Some(id) = selection.primary.clone() {
+            chrome.open.right = true;
+            if let Some((n, _)) = nodes.iter().find(|(n, _)| n.id == id)
+                && n.kind == aneural_core::kinds::NodeKind::PLAN
+            {
+                let file = n.prop_str("file").map(String::from);
+                chrome.review.open(id, file.as_deref());
+                filters.dirty = true;
+            }
+        }
+    }
     let palette = vibe.palette;
     let accent = theme::egui_color(palette.accent);
     let mut root = egui::Ui::new(
@@ -339,16 +378,16 @@ fn panels(
         ui.horizontal(|ui| {
             // With the panel open its own corner holds the button; this is
             // just the way back once it is gone.
-            if !open.left
+            if !chrome.open.left
                 && ui
                     .button("⏵")
                     .on_hover_text("Show the filters")
                     .clicked()
             {
-                open.left = true;
+                chrome.open.left = true;
             }
             ui.label(egui::RichText::new("🍄 Aneural").color(accent).strong());
-            workspace_menu(ui, &ws.name(), &recents, &mut open_request);
+            workspace_menu(ui, &ws.name(), &recents, &mut chrome.request);
             if ui
                 .button("spores")
                 .on_hover_text("Browse the Open Spores Marketplace")
@@ -387,6 +426,28 @@ fn panels(
                 "{} nodes · {} edges",
                 graph.node_count, graph.edge_count
             ));
+            // What is live, in one word and a count. Portals show the warmest
+            // few; this is how you know there were more, and it is the only
+            // sign of them at all when `gui.portals` is 0.
+            if ws.config.gui.live
+                && let Some(newest) = chrome.signals.newest()
+            {
+                let count = chrome.signals.all().len();
+                let chip = ui.label(
+                    egui::RichText::new(match count {
+                        1 => newest.headline.clone(),
+                        n => format!("{} · {} live", newest.headline, n),
+                    })
+                    .color(theme::egui_color(palette.accent)),
+                );
+                let lines: Vec<String> = chrome
+                    .signals
+                    .all()
+                    .iter()
+                    .map(|s| format!("{}\n    {}", s.headline, s.detail))
+                    .collect();
+                chip.on_hover_text(lines.join("\n"));
+            }
             if let Some(err) = &status.last_error {
                 ui.label(
                     egui::RichText::new(format!("⚠ {err}"))
@@ -394,13 +455,13 @@ fn panels(
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !open.right
+                if !chrome.open.right
                     && ui
                         .button("⏴")
                         .on_hover_text("Show the inspector")
                         .clicked()
                 {
-                    open.right = true;
+                    chrome.open.right = true;
                 }
                 let dial = time_of_day_dial(
                     ui,
@@ -422,7 +483,7 @@ fn panels(
 
     let mut close_left = false;
     let mut pointed = None;
-    egui::Panel::left("filters").resizable(true).default_size(240.0).show_collapsible(ctx, &mut open.left, |ui| {
+    egui::Panel::left("filters").resizable(true).default_size(240.0).show_collapsible(ctx, &mut chrome.open.left, |ui| {
         close_left = panel_header(ui, "Filters", "⏴", "Hide the filters");
         let resp = ui.add(egui::TextEdit::singleline(&mut filters.query).hint_text("search label / path"));
         if resp.changed() {
@@ -494,10 +555,294 @@ fn panels(
     });
 
     let mut close_right = false;
-    egui::Panel::right("inspector").resizable(true).default_size(310.0).show_collapsible(ctx, &mut open.right, |ui| {
+    // The plan drawer sits between the canvas and the inspector: reading a plan
+    // means looking at the graph and at other nodes while it stays open, which
+    // it could not do if it lived in the inspector.
+    let mut close_plan = false;
+    if let Some(plan_id) = chrome.review.plan.clone() {
+        let reading = review::read(&graph, &plan_id);
+        let plan_node = nodes
+            .iter()
+            .find(|(n, _)| n.id == plan_id)
+            .map(|(n, _)| n.clone());
+        egui::Panel::right("plan")
+            .resizable(true)
+            .default_size(380.0)
+            .show(ctx, |ui| {
+                close_plan = panel_header(ui, "Plan", "⏵", "Close the plan");
+                let Some(n) = plan_node else {
+                    ui.label(egui::RichText::new("This plan is no longer in the graph.").weak());
+                    return;
+                };
+                ui.label(egui::RichText::new(&n.label).strong().size(15.0));
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(state) = n.prop_str("state") {
+                        let color = match state {
+                            "built" => theme::egui_color(palette.accent),
+                            "in progress" => theme::egui_color(palette.selection),
+                            _ => theme::egui_color(palette.dim),
+                        };
+                        crate::marketplace::chip(ui, state, color);
+                    }
+                    if let Some(at) = n.prop_str("approvedAt") {
+                        ui.label(
+                            egui::RichText::new(format!("approved {}", &at[..10.min(at.len())]))
+                                .weak()
+                                .small(),
+                        );
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut chrome.review.only, "Only this plan")
+                        .changed()
+                    {
+                        filters.dirty = true;
+                    }
+                    if let Some(file) = n.prop_str("file")
+                        && ui.button("Open").clicked()
+                    {
+                        open_in_editor(std::path::Path::new(file));
+                    }
+                });
+
+                // Where the work stands, moment by moment, and the steps it
+                // was meant to go in. Both are built here because this is the
+                // one place holding the node, the graph and the edges the
+                // times and the step numbers live on; the spotlight, the
+                // camera and the filters read them back off `Review`.
+                let edge_props = |kind: &str, src: &NodeId, dst: &NodeId| {
+                    let key = (kind.to_string(), src.clone(), dst.clone());
+                    let e = graph.edges.get(&key)?;
+                    edges.get(*e).ok().map(|ge| ge.props.clone())
+                };
+                chrome.review.touches = review::timeline(&graph, &reading, &|src, dst| {
+                    edge_props(EdgeKind::MODIFIES, src, dst)
+                });
+                let headings = review::Heading::all(n.props.get("steps"));
+                chrome.review.walk = reading.steps(&headings, &|file| {
+                    edge_props(EdgeKind::ANNOTATES, &plan_id, file)?
+                        .get("step")?
+                        .as_u64()
+                        .map(|i| i as usize)
+                });
+
+                // The walk. A plan with one heading is not a walk, so it keeps
+                // the reading it had before this existed.
+                let steps = chrome.review.walk.len();
+                if steps > 1 {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let at = chrome.review.step;
+                        if ui
+                            .add_enabled(at.is_some(), egui::Button::new("◀"))
+                            .on_hover_text("Previous step")
+                            .clicked()
+                        {
+                            // Back off the first step is back to the whole plan,
+                            // so the walk has a way out at both ends.
+                            chrome.review.go_to_step(at.unwrap().checked_sub(1));
+                        }
+                        let label = match at {
+                            Some(i) => format!("{} / {steps}", i + 1),
+                            None => format!("all {steps}"),
+                        };
+                        ui.label(egui::RichText::new(label).small().monospace());
+                        if ui
+                            .add_enabled(at.is_none_or(|i| i + 1 < steps), egui::Button::new("▶"))
+                            .on_hover_text("Next step")
+                            .clicked()
+                        {
+                            chrome.review.go_to_step(Some(at.map_or(0, |i| i + 1)));
+                        }
+                        if at.is_some() && ui.button("whole plan").clicked() {
+                            chrome.review.go_to_step(None);
+                        }
+                    });
+                    if let Some(step) = chrome.review.step.and_then(|i| chrome.review.walk.get(i)) {
+                        ui.horizontal_wrapped(|ui| {
+                            // A subsection is indented, so a walk through
+                            // `Build` and then `A.`, `B.`, `C.` still reads as
+                            // the outline it was written as.
+                            if step.level > 2 {
+                                ui.add_space(10.0 * (step.level - 2) as f32);
+                            }
+                            ui.label(egui::RichText::new(&step.heading).strong());
+                            let color = match step.status() {
+                                "done" => palette.accent,
+                                "started" => palette.selection,
+                                _ => palette.dim,
+                            };
+                            crate::marketplace::chip(ui, step.status(), theme::egui_color(color));
+                        });
+                    }
+                }
+
+                let total = chrome.review.touches.len();
+                if total > 1 {
+                    ui.separator();
+                    // `None` is the live end. The slider's last notch means
+                    // "keep up with it", not "stop at the last thing so far".
+                    let mut pos = chrome.review.at.unwrap_or(total - 1);
+                    let live = chrome.review.at.is_none();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("⏱").small());
+                        if ui
+                            .add(egui::Slider::new(&mut pos, 0..=total - 1).show_value(false))
+                            .changed()
+                        {
+                            // Pulled to the end is a request to follow again.
+                            chrome.review.at = (pos + 1 < total).then_some(pos);
+                            filters.dirty = true;
+                        }
+                    });
+                    let caption = match chrome.review.moment() {
+                        Some(at) => {
+                            format!("{} of {total} · {}", pos + 1, &at[..16.min(at.len())])
+                        }
+                        None if live => format!("all {total} touches, keeping up"),
+                        None => format!("{} of {total}", pos + 1),
+                    };
+                    ui.label(egui::RichText::new(caption).weak().small());
+                }
+
+                ui.separator();
+                // The comparison the drawer exists for. A plan that named files it
+                // then left alone is the thing a reader cannot get from a diff.
+                let step = chrome
+                    .review
+                    .step
+                    .and_then(|i| chrome.review.walk.get(i))
+                    .cloned();
+                let files = match &step {
+                    Some(step) => step.files.clone(),
+                    None => reading.files(),
+                };
+                let next_line = chrome
+                    .review
+                    .step
+                    .and_then(|i| chrome.review.walk.get(i + 1))
+                    .map(|next| next.line);
+                let count =
+                    |want: review::Standing| files.iter().filter(|(s, _)| *s == want).count();
+                ui.label(
+                    egui::RichText::new(match &step {
+                        None => format!(
+                            "{} named · {} touched · {} named but untouched",
+                            reading.named.len(),
+                            reading.touched.len(),
+                            count(review::Standing::Untouched),
+                        ),
+                        Some(_) if files.is_empty() => "this step names no file".to_string(),
+                        Some(_) => format!(
+                            "{} here · {} still untouched",
+                            files.len(),
+                            count(review::Standing::Untouched),
+                        ),
+                    })
+                    .weak()
+                    .small(),
+                );
+                // Rewinding has to show in the list too, or dragging the
+                // timeline reads as nothing happening at all.
+                let by_now = chrome.review.touched_by_now();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("plan-body")
+                    .show(ui, |ui| {
+                        let mut shown: Option<review::Standing> = None;
+                        for (standing, file) in &files {
+                            if shown != Some(*standing) {
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(standing.label()).weak().small());
+                                shown = Some(*standing);
+                            }
+                            let reached = by_now.as_ref().is_none_or(|seen| seen.contains(file));
+                            let color = match standing {
+                                _ if !reached => palette.dim,
+                                review::Standing::Done => palette.accent,
+                                review::Standing::Untouched => palette.warning,
+                                review::Standing::Unplanned => palette.selection,
+                            };
+                            if ui
+                                .link(
+                                    egui::RichText::new(file.path_part())
+                                        .monospace()
+                                        .small()
+                                        .color(theme::egui_color(color)),
+                                )
+                                .clicked()
+                            {
+                                chrome.review.go_to = Some(file.clone());
+                            }
+                        }
+
+                        if !reading.sessions.is_empty() || !reading.commits.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Carried out by").strong().small());
+                            for actor in reading.sessions.iter().chain(reading.commits.iter()) {
+                                let label = nodes
+                                    .iter()
+                                    .find(|(x, _)| &x.id == actor)
+                                    .map(|(x, _)| x.label.clone())
+                                    .unwrap_or_else(|| actor.to_string());
+                                if ui.link(egui::RichText::new(label).small()).clicked() {
+                                    chrome.review.go_to = Some(actor.clone());
+                                }
+                            }
+                        }
+
+                        ui.separator();
+                        // In step mode the body is only that step's prose,
+                        // sliced out of the text already in hand. A narrow
+                        // drawer and a whole document do not go together, and
+                        // scroll-syncing a rendered markdown view to a line
+                        // number is a lot of machinery for the same effect.
+                        let shown_text = chrome.review.text().map(|text| match &step {
+                            None => text.to_string(),
+                            Some(step) => crate::markdown::slice(text, step.line, next_line),
+                        });
+                        match shown_text {
+                            None => {
+                                ui.label(egui::RichText::new("reading…").weak().small());
+                            }
+                            Some(text) if text.trim().is_empty() => {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Work the plan never mentioned. There is no prose for it \
+                                         — that is the point of the step.",
+                                    )
+                                    .weak()
+                                    .small(),
+                                );
+                            }
+                            Some(text) => {
+                                let clicked = crate::markdown::body(ui, &text, &palette, &|p| {
+                                    reading.resolve(p).is_some()
+                                });
+                                if let Some(path) = clicked.path {
+                                    chrome.review.go_to = reading.resolve(&path);
+                                }
+                            }
+                        }
+                    });
+            });
+    }
+    if close_plan {
+        chrome.review.close();
+        filters.dirty = true;
+    }
+    if let Some(id) = chrome.review.go_to.take() {
+        selection.primary = Some(id);
+    }
+    let mut open_plan: Option<(NodeId, Option<String>)> = None;
+
+    egui::Panel::right("inspector").resizable(true).default_size(310.0).show_collapsible(ctx, &mut chrome.open.right, |ui| {
         close_right = panel_header(ui, "Inspector", "⏵", "Hide the inspector");
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut select_next: Option<NodeId> = None;
+            let mut review_this: Option<(NodeId, Option<String>)> = None;
             match selection.primary.clone() {
                 None => {
                     ui.label(egui::RichText::new("Select a node to inspect it. The selection and filters define the context served over MCP.").weak());
@@ -529,6 +874,12 @@ fn panels(
                             } else if ui.button("Pin").clicked() {
                                 selection.toggle_pin(n.id.clone());
                             }
+                            // A plan is the one node with more to say than a
+                            // props grid can hold, so it gets a drawer.
+                            if n.kind == aneural_core::kinds::NodeKind::PLAN
+                                && ui.button("Read this plan").clicked() {
+                                    review_this = Some((n.id.clone(), n.prop_str("file").map(String::from)));
+                                }
                             if let Some(r) = &n.repo_id {
                                 ui.label(egui::RichText::new(format!("repo: {}", r.path_part())).weak());
                             }
@@ -537,12 +888,73 @@ fn panels(
                                     ui.separator();
                                     egui::Grid::new("props").num_columns(2).striped(true).show(ui, |ui| {
                                         for (k, v) in map {
+                                            // A plan's steps are a document
+                                            // outline, not a value to read as
+                                            // JSON in a two-column grid. The
+                                            // drawer walks them instead.
+                                            // The spend by model is a table,
+                                            // and gets one below.
+                                            // A run's tail is kilobytes of
+                                            // program output; in a grid cell it
+                                            // pushes every other prop off the
+                                            // panel. It gets its own block.
+                                            if k == "steps" || k == "byModel" || k == "tail" {
+                                                continue;
+                                            }
                                             ui.label(egui::RichText::new(k).weak());
                                             let text = match v {
                                                 serde_json::Value::String(s) => s.clone(),
                                                 other => other.to_string(),
                                             };
                                             ui.add(egui::Label::new(text).wrap());
+                                            ui.end_row();
+                                        }
+                                    });
+                                }
+                            // The end of what a run printed. Monospace and
+                            // scrolling, because it is program output: the
+                            // alignment carries meaning and there may be
+                            // kilobytes of it. Height-capped so the edges list
+                            // below stays reachable.
+                            if let Some(tail) = n.props.get("tail").and_then(|v| v.as_str())
+                                && !tail.trim().is_empty() {
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("Output").strong());
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("run-tail")
+                                        .max_height(220.0)
+                                        .stick_to_bottom(true)
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(tail).monospace().small(),
+                                                )
+                                                .wrap(),
+                                            );
+                                        });
+                                }
+                            // What it cost, by model. A tally spanning two
+                            // models is two different prices, so the split is
+                            // the answer and the total is the summary — which
+                            // is the wrong way round for a JSON blob in a
+                            // two-column grid.
+                            if let Some(rows) = n.props.get("byModel").and_then(|v| v.as_array())
+                                && !rows.is_empty() {
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("Tokens by model").strong());
+                                    egui::Grid::new("by-model").num_columns(4).striped(true).show(ui, |ui| {
+                                        for head in ["model", "tokens", "out", "cache read"] {
+                                            ui.label(egui::RichText::new(head).weak().small());
+                                        }
+                                        ui.end_row();
+                                        for row in rows {
+                                            let n = |k: &str| thousands(row.get(k).and_then(|v| v.as_i64()).unwrap_or(0));
+                                            ui.label(egui::RichText::new(
+                                                row.get("model").and_then(|m| m.as_str()).unwrap_or("?"),
+                                            ).small());
+                                            for k in ["tokens", "out", "cacheRead"] {
+                                                ui.label(egui::RichText::new(n(k)).small().monospace());
+                                            }
                                             ui.end_row();
                                         }
                                     });
@@ -573,6 +985,9 @@ fn panels(
             if let Some(id) = select_next {
                 selection.primary = Some(id);
             }
+            if let Some((id, file)) = review_this {
+                open_plan = Some((id, file));
+            }
             ui.separator();
             ui.label(egui::RichText::new("Pinned").strong());
             let mut unpin: Option<NodeId> = None;
@@ -597,11 +1012,15 @@ fn panels(
         });
     });
 
-    open.left &= !close_left;
+    if let Some((id, file)) = open_plan {
+        chrome.review.open(id, file.as_deref());
+        filters.dirty = true;
+    }
+    chrome.open.left &= !close_left;
     if filters.pointed != pointed {
         filters.pointed = pointed;
     }
-    open.right &= !close_right;
+    chrome.open.right &= !close_right;
 
     // whatever the panels left over is the graph canvas
     let rect = ctx.available_rect_before_wrap();
@@ -636,7 +1055,7 @@ fn panels(
                     .on_hover_text("Fit the whole graph in view (F)")
                     .clicked()
                 {
-                    frame.0 = true;
+                    frame.all();
                 }
             });
         });
@@ -670,4 +1089,21 @@ fn open_in_editor(path: &std::path::Path) {
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "code".into());
     let _ = std::process::Command::new(editor).arg(path).spawn();
+}
+
+/// A count with thousands separators. Token counts run to ten figures, and a
+/// ten-figure number without them is a smear rather than a quantity.
+fn thousands(n: i64) -> String {
+    let digits = n.abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    match n < 0 {
+        true => format!("-{out}"),
+        false => out,
+    }
 }

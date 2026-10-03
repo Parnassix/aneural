@@ -128,6 +128,18 @@ fn drain_registry_events(
                     force: true,
                 });
             }
+            RegistryEvent::EnabledSaved { id, on } => {
+                market.busy = None;
+                market.notice = Some((
+                    match on {
+                        true => format!("enabled {id}"),
+                        false => format!("disabled {id}"),
+                    },
+                    false,
+                ));
+                // Now that it is written, converge the graph to match.
+                let _ = engine_tx.0.send(EngineCommand::SetSporeEnabled { id, on });
+            }
             RegistryEvent::Uninstalled(id) => {
                 market.busy = None;
                 market.notice = Some((format!("removed {id}"), false));
@@ -174,7 +186,9 @@ fn tier_color(tier: &str, p: &theme::Palette) -> egui::Color32 {
     }
 }
 
-fn chip(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+/// A small outlined badge. Shared with the plan drawer, which labels a
+/// plan's state the same way the marketplace labels a tier.
+pub fn chip(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     egui::Frame::new()
         .fill(color.gamma_multiply(0.20))
         .stroke(egui::Stroke::new(1.0, color))
@@ -501,9 +515,18 @@ fn detail(
                         Some(info) => {
                             let mut on = info.enabled;
                             if ui.checkbox(&mut on, "Enabled").changed() {
-                                let _ = engine_tx
-                                    .0
-                                    .send(EngineCommand::SetSporeEnabled { id: id.clone(), on });
+                                // Through the worker, not straight at the
+                                // engine: the engine converges the graph but
+                                // does not write the config, so a direct send
+                                // reverted on restart. The graph follows once
+                                // the write lands, in `EnabledSaved`.
+                                market.busy = Some(match on {
+                                    true => format!("enabling {id}"),
+                                    false => format!("disabling {id}"),
+                                });
+                                market
+                                    .pending
+                                    .push(RegistryCommand::SetEnabled { id: id.clone(), on });
                             }
                             // Only a spore that reads an API has anything to
                             // re-fetch; the rest converge through the watcher.
@@ -645,7 +668,7 @@ fn consent_sheet(
                     .id_salt("consent-readme")
                     .max_height(160.0)
                     .show(ui, |ui| {
-                        readme_body(ui, readme, palette);
+                        crate::markdown::body(ui, readme, palette, &|_| false);
                     });
             });
         }
@@ -676,35 +699,5 @@ fn consent_sheet(
         market.consent = None;
     } else if cancelled || sheet.should_close() {
         market.consent = None;
-    }
-}
-
-/// Just enough markdown to make a README readable, using the engine's own
-/// parser rather than adding a rendering dependency to the GUI.
-fn readme_body(ui: &mut egui::Ui, text: &str, palette: &theme::Palette) {
-    let mut in_code = false;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("```") {
-            in_code = !in_code;
-            let _ = rest;
-            continue;
-        }
-        if in_code {
-            ui.label(egui::RichText::new(line).monospace().small());
-        } else if let Some(h) = line.strip_prefix("### ") {
-            ui.label(egui::RichText::new(h).strong());
-        } else if let Some(h) = line.strip_prefix("## ") {
-            ui.label(egui::RichText::new(h).strong().size(14.0));
-        } else if let Some(h) = line.strip_prefix("# ") {
-            ui.label(egui::RichText::new(h).strong().size(15.0));
-        } else if line.trim().is_empty() {
-            ui.add_space(4.0);
-        } else if let Some(item) = line.strip_prefix("- ") {
-            ui.label(
-                egui::RichText::new(format!("• {item}")).color(theme::egui_color(palette.text)),
-            );
-        } else {
-            ui.add(egui::Label::new(line).wrap());
-        }
     }
 }

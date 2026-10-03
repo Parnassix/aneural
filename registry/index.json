@@ -133,21 +133,51 @@
       "firstParty": true
     },
     {
-      "id": "aneural.wiki-links",
+      "id": "aneural.scripts",
       "version": "0.1.0",
-      "displayName": "Notes & Wiki-links",
-      "description": "Obsidian-style knowledge without the vault: `.aneural/notes/*.md` become Note nodes, and every `[[Wiki Link]]` in any markdown file becomes a RELATES_TO edge between files.",
+      "displayName": "Scripts",
+      "description": "Finds the things in a workspace you can run — files with a shebang, and files that live in a scripts/ or bin/ directory — and the schedules declared for them in crontabs and GitHub Actions workflows. Reads files only; it never runs anything.",
       "license": "MIT",
-      "repo": "github:Parnassix/aneural#spores/wiki-links/v0.1.0",
+      "repo": "github:Parnassix/aneural#spores/scripts/v0.1.0",
+      "path": "spores/scripts",
+      "files": {
+        "README.md": "34137182b45db6c81074d5bf28b19d1ec9bc921e4d4cfabd3c29e880faf654aa",
+        "spore.json": "07c912facb3effb85b6cd8f7be41f3d32bed227171068fa9dae26fb60a000e6e"
+      },
+      "keywords": [
+        "scripts",
+        "schedule",
+        "cron",
+        "automation"
+      ],
+      "categories": [
+        "automation"
+      ],
+      "nodeKinds": [
+        "Script",
+        "Schedule"
+      ],
+      "capabilities": [],
+      "firstParty": true
+    },
+    {
+      "id": "aneural.wiki-links",
+      "version": "0.2.0",
+      "displayName": "Notes & Wiki-links",
+      "description": "Obsidian-style knowledge, vault or no vault: `.aneural/notes/*.md` become Note nodes, every `[[Wiki Link]]` becomes a RELATES_TO edge, frontmatter `tags:` become shared Tag nodes, links written to a note's `aliases:` resolve, and a link to a note nobody has written yet is kept as a Missing Note rather than dropped.",
+      "license": "MIT",
+      "repo": "github:Parnassix/aneural#spores/wiki-links/v0.2.0",
       "path": "spores/wiki-links",
       "files": {
-        "README.md": "0356b433ccfcad83832868318a2521913cf956606cb38e52119faebcae60e738",
-        "spore.json": "2ac99f3e012dd3baa4c5a7d897ef74c216ab5ee2f755af1e676809d7f535803f"
+        "README.md": "62919529d5c4f9c246bb8ef601fbe9acf50f72db943b2589b573e484d53679e9",
+        "spore.json": "eca031820fcb50d989f27a785e3a9cdcdf5c6f18a7fa169443a8275e9e3ee3cd"
       },
       "keywords": [],
       "categories": [],
       "nodeKinds": [
-        "Note"
+        "Note",
+        "Tag",
+        "MissingNote"
       ],
       "capabilities": [],
       "firstParty": true

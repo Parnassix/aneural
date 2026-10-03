@@ -23,6 +23,8 @@ pub struct Config {
     pub languages: Vec<String>,
     pub typescript: TypeScriptConfig,
     pub spores: SporesConfig,
+    pub history: HistoryConfig,
+    pub runs: RunsConfig,
     /// Per-kind style overrides and lightweight custom kinds.
     pub node_types: BTreeMap<String, NodeTypeStyle>,
     pub gui: GuiConfig,
@@ -50,6 +52,8 @@ impl Default for Config {
             languages: Language::ALL.iter().map(|s| s.to_string()).collect(),
             typescript: TypeScriptConfig::default(),
             spores: SporesConfig::default(),
+            history: HistoryConfig::default(),
+            runs: RunsConfig::default(),
             node_types: BTreeMap::new(),
             gui: GuiConfig::default(),
         }
@@ -59,6 +63,112 @@ impl Default for Config {
 impl Config {
     pub fn language_enabled(&self, lang: &str) -> bool {
         self.languages.iter().any(|l| l == lang)
+    }
+}
+
+/// What this machine is set to run, and whether it may.
+///
+/// `enabled` is off until the workspace turns it on, and that default *is* the
+/// consent: it reads `~/Library/LaunchAgents` and asks `launchctl` what is
+/// loaded, which is outside the workspace the user opened. `execute` is a
+/// second, separate gate for actually starting a process, because reading what
+/// is scheduled and running it are not the same permission.
+///
+/// This file is committed, so everything here is a *declaration* a team can
+/// share. Nothing in it may arm a machine on `git pull`: whether an agent is
+/// installed on this particular machine is recorded in gitignored
+/// `.aneural/state/`, never here.
+///
+/// Every switch here defaults to off, and that is the whole point: there is
+/// nothing in this struct that opts anyone into anything. The two retention
+/// numbers are the exception — they are not permissions, and "keep forever" is
+/// a worse default for a committed file than a bounded window.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RunsConfig {
+    /// Read the schedules this machine has, and work out what is due. Off until
+    /// the workspace says otherwise, and that default *is* the consent.
+    pub enabled: bool,
+    /// Actually start processes. Reserved; nothing reads it yet.
+    pub execute: bool,
+    /// Extra cadence words this project uses, to days. Extends the builtin
+    /// vocabulary rather than replacing it; an entry here also overrides a
+    /// builtin word, which is how a project that means something else by
+    /// "continuous" says so.
+    pub cadences: BTreeMap<String, u32>,
+    /// Override the launch-agents directory. Empty means
+    /// `~/Library/LaunchAgents`. Exists so tests never read the real one, the
+    /// same reason [`HistoryConfig::claude_root`] does.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub launch_agents_root: String,
+    /// What this machine calls itself in the run journal. Empty means the
+    /// hostname.
+    ///
+    /// It is in the committed config rather than derived every time because it
+    /// is a *directory name in git history*: the day someone renames their
+    /// laptop, a derived name would silently start a second journal alongside
+    /// the first and the two would never be recognised as the same machine.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub machine: String,
+    /// Drop journal segments older than this. Whole files only — a segment is
+    /// never rewritten, because rewriting one breaks both the union merge and
+    /// every reader's offset.
+    pub keep_days: u32,
+    /// Keep at most this many runs per script in the index. Bounds the derived
+    /// database without touching the committed journal.
+    pub keep_per_script: u32,
+}
+
+impl Default for RunsConfig {
+    fn default() -> Self {
+        RunsConfig {
+            enabled: false,
+            execute: false,
+            cadences: BTreeMap::new(),
+            launch_agents_root: String::new(),
+            machine: String::new(),
+            keep_days: 90,
+            keep_per_script: 200,
+        }
+    }
+}
+
+/// Where the story of a change comes from: the repositories' own history, and
+/// the agent sessions that produced it.
+///
+/// `claude` is off until the workspace turns it on, and that default *is* the
+/// consent — it reads transcripts of this workspace's sessions, which contain
+/// everything that was said in them. Nothing here is a spore capability: these
+/// are engine producers, like the walker, and the tier ladder governs what a
+/// *downloadable* spore may reach.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HistoryConfig {
+    /// Read each repository's commits. On by default: the repository is part of
+    /// the workspace the user already opened.
+    pub git: bool,
+    /// How far back to read. Commits older than this are not indexed at all.
+    pub max_commits: u32,
+    /// Read this workspace's Claude Code sessions from `~/.claude`.
+    pub claude: bool,
+    /// Keep the text of what was typed on the session node. Session props are
+    /// served to agents over MCP, so this puts your prompts within reach of
+    /// whatever reads the focus.
+    pub claude_prompts: bool,
+    /// Override the Claude Code state directory. Empty means `~/.claude`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub claude_root: String,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        HistoryConfig {
+            git: true,
+            max_commits: 2_000,
+            claude: false,
+            claude_prompts: false,
+            claude_root: String::new(),
+        }
     }
 }
 
@@ -311,6 +421,18 @@ pub struct GuiConfig {
     /// clock — daylit through working hours, bioluminescent after dark —
     /// while `"day"` and `"night"` hold it at one end.
     pub circadian: String,
+    /// React to what is happening on this machine while you work: a glow on
+    /// the nodes involved and a portal onto them. `false` is today's app,
+    /// pixel for pixel.
+    pub live: bool,
+    /// How many portals may be open at once. `0` keeps the glow and the
+    /// top-bar count and draws no apertures.
+    pub portals: u32,
+    /// How hard to look: `"auto"` samples eagerly when the machine is idle and
+    /// backs off under load or when the window is behind something else.
+    /// `"eager"` and `"calm"` pin the two ends; `"off"` never starts the
+    /// sampler, so nothing outside the graph is read at all.
+    pub live_pace: String,
 }
 
 impl Default for GuiConfig {
@@ -320,6 +442,9 @@ impl Default for GuiConfig {
             label_zoom_threshold: 0.8,
             growth_budget_per_frame: 200,
             circadian: "auto".into(),
+            live: true,
+            portals: 3,
+            live_pace: "auto".into(),
         }
     }
 }
@@ -459,6 +584,67 @@ pub fn builtin_node_types() -> Vec<NodeTypeDef> {
             "#b0b0b0",
             "circle",
             "An exported symbol (reserved)",
+        ),
+        // The `plans` spore emits Plan nodes too, but the type is builtin so
+        // that the `claude` producer's plans stay styled when it is disabled.
+        NodeTypeDef::new(
+            NodeKind::PLAN,
+            "Plan",
+            "LuMap",
+            "#a58cd6",
+            "hexagon",
+            "A plan document",
+        ),
+        NodeTypeDef::new(
+            NodeKind::SESSION,
+            "Session",
+            "LuMessageSquare",
+            "#6fa8a0",
+            "pill",
+            "A Claude Code session that worked here",
+        ),
+        NodeTypeDef::new(
+            NodeKind::COMMIT,
+            "Commit",
+            "VsSourceControl",
+            "#b08968",
+            "diamond",
+            "A commit in one of the workspace's repositories",
+        ),
+        NodeTypeDef::new(
+            NodeKind::USAGE,
+            "Usage",
+            "LuGauge",
+            "#c0843f",
+            "diamond",
+            "What the agent sessions here have cost in tokens",
+        ),
+        // The `scripts` spore emits these, but the types are builtin for the
+        // same reason `Plan` is: the `runs` producer names them too, and a Run
+        // hanging off an untyped Script tells the reader nothing.
+        NodeTypeDef::new(
+            NodeKind::SCRIPT,
+            "Script",
+            "LuTerminal",
+            "#c9736b",
+            "square",
+            "Something in this workspace you can run",
+        ),
+        NodeTypeDef::new(
+            NodeKind::SCHEDULE,
+            "Schedule",
+            "LuCalendarClock",
+            "#7d9ec0",
+            "pill",
+            "When a script is declared to run",
+        ),
+        NodeTypeDef::new(
+            NodeKind::RUN,
+            "Run",
+            "LuHistory",
+            "#a8a15f",
+            "diamond",
+            "The most recent run of a script",
         ),
     ]
 }

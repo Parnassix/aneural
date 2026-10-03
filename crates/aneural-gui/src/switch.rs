@@ -133,11 +133,19 @@ fn open_requested(world: &mut World) {
     world.insert_resource(IndexStatus::default());
     world.insert_resource(Filters::default());
     world.insert_resource(Selection::default());
+    // Signals are about the workspace that was open; nothing that happened in
+    // it is news in this one. The probe is told the new one on its next pass,
+    // so the thread itself keeps running.
+    world.insert_resource(crate::live::Signals::default());
+    world.insert_resource(crate::live::Named::default());
     world.insert_resource(Hovered::default());
     world.insert_resource(DragState::default());
     world.insert_resource(FocusState::default());
-    world.insert_resource(AutoFollow(true));
-    world.insert_resource(FrameRequest(true));
+    world.insert_resource(AutoFollow::default());
+    world.insert_resource(FrameRequest {
+        now: true,
+        ..Default::default()
+    });
     world.resource_mut::<LayoutParams>().stir();
 
     let (rx, tx) = start_engine(&root);

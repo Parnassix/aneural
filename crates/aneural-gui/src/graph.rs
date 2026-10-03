@@ -18,12 +18,24 @@ pub struct GraphNode {
     pub props: serde_json::Value,
 }
 
+impl GraphNode {
+    /// A string prop, as `aneural_core::Node::prop_str` reads one. The GUI
+    /// keeps props as raw JSON, so every reader would otherwise repeat this.
+    pub fn prop_str(&self, key: &str) -> Option<&str> {
+        self.props.get(key)?.as_str()
+    }
+}
+
 #[derive(Component, Clone, Debug)]
 pub struct GraphEdge {
     pub kind: String,
     pub src: Entity,
     pub dst: Entity,
     pub seed: u32,
+    /// The edge's own props. Kept because *when* a thing happened lives here
+    /// and nowhere else: a session's `MODIFIES` carries `firstAt`/`lastAt`, and
+    /// a commit's carries `at`, which is what a timeline is made of.
+    pub props: serde_json::Value,
 }
 
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -65,6 +77,10 @@ pub type EdgeKey = (String, NodeId, NodeId);
 #[derive(Resource, Default)]
 pub struct GraphState {
     pub by_id: HashMap<NodeId, Entity>,
+    /// The other direction, for the places that hold an entity and need to ask
+    /// something about the node — the renderer deciding whether an edge's ends
+    /// float, for one.
+    pub ids: EntityHashMap<NodeId>,
     pub edges: HashMap<EdgeKey, Entity>,
     pub pending_edges: Vec<Edge>,
     /// Adjacency (undirected) for BFS/focus mode: id → (neighbor id, edge kind).
@@ -77,6 +93,21 @@ pub struct GraphState {
     pub degree: EntityHashMap<Degrees>,
     pub node_count: usize,
     pub edge_count: usize,
+    /// What the last live delta did, for whoever wants to react to it.
+    ///
+    /// Filled only for [`DeltaPhase::Live`] and drained every frame by
+    /// [`crate::live`]. The initial index is skipped deliberately: three
+    /// thousand nodes arriving because the app just opened is not news.
+    pub stirred: Vec<(NodeId, Stir)>,
+}
+
+/// What happened to one node in a live delta.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stir {
+    /// It was not here a moment ago.
+    Appeared,
+    /// It was, and its label or its props are not what they were.
+    Changed,
 }
 
 /// A node's link count, per kind. Density is a
@@ -105,6 +136,13 @@ impl Degrees {
             .map(|(_, n)| *n)
             .unwrap_or(0)
     }
+
+    /// Does any kind this node still has an edge of satisfy `want`?
+    pub fn any(&self, want: impl Fn(&str) -> bool) -> bool {
+        self.by_kind
+            .iter()
+            .any(|(kind, n)| *n > 0 && want(kind.as_str()))
+    }
 }
 
 impl GraphState {
@@ -117,7 +155,44 @@ impl GraphState {
     /// idea, a plan) has no place in the folder tree, so rather than being
     /// strung to what it relates to it hovers nearby, like a spore.
     pub fn floats(&self, e: Entity, id: &NodeId) -> bool {
-        !self.parent.contains_key(id) && self.kind_degree(e, EdgeKind::RELATES_TO) > 0
+        if self.parent.contains_key(id) {
+            return false;
+        }
+        self.degree
+            .get(&e)
+            .is_some_and(|d| d.any(|kind| !EdgeKind::is_strand(kind)))
+    }
+
+    /// [`Self::floats`] for a node held only as an entity.
+    pub fn floats_entity(&self, e: Entity) -> bool {
+        self.ids.get(&e).is_some_and(|id| self.floats(e, id))
+    }
+
+    /// Nodes this one points at with an edge of `kind`.
+    pub fn out_of(&self, id: &NodeId, kind: &str) -> Vec<NodeId> {
+        self.directed(id, kind, true)
+    }
+
+    /// Nodes that point at this one with an edge of `kind`.
+    pub fn pointing_at(&self, id: &NodeId, kind: &str) -> Vec<NodeId> {
+        self.directed(id, kind, false)
+    }
+
+    /// Adjacency is undirected, so direction is recovered by asking whether the
+    /// edge exists the way round we want.
+    fn directed(&self, id: &NodeId, kind: &str, outgoing: bool) -> Vec<NodeId> {
+        self.neighbors(id)
+            .iter()
+            .filter(|(_, k)| k == kind)
+            .map(|(other, _)| other.clone())
+            .filter(|other| {
+                let key = match outgoing {
+                    true => (kind.to_string(), id.clone(), other.clone()),
+                    false => (kind.to_string(), other.clone(), id.clone()),
+                };
+                self.edges.contains_key(&key)
+            })
+            .collect()
     }
 
     pub fn neighbors(&self, id: &NodeId) -> &[(NodeId, String)] {
@@ -185,8 +260,12 @@ pub fn apply_delta(
         remove_node(commands, graph, id);
     }
     // nodes
+    let watch = delta.phase == aneural_core::graph::DeltaPhase::Live;
     for node in delta.nodes {
-        upsert_node(commands, graph, ws, v, existing, node);
+        let stir = upsert_node(commands, graph, ws, v, existing, node);
+        if watch && let Some((id, stir)) = stir {
+            graph.stirred.push((id, stir));
+        }
     }
     // edges
     for edge in delta.edges {
@@ -219,6 +298,8 @@ fn parent_pos(
     existing.get(*e).ok().map(|(_, p)| p.0)
 }
 
+/// Insert or update one node, saying what that turned out to be so a caller
+/// watching a live delta can tell news from a re-emission.
 fn upsert_node(
     commands: &mut Commands,
     graph: &mut GraphState,
@@ -226,16 +307,24 @@ fn upsert_node(
     v: &mut Visuals,
     existing: &mut Query<(&mut GraphNode, &Pos)>,
     node: Node,
-) {
+) -> Option<(NodeId, Stir)> {
     if let Some(&e) = graph.by_id.get(&node.id) {
+        let mut moved = None;
         if let Ok((mut gn, _)) = existing.get_mut(e) {
+            // Compared before the overwrite, because afterwards there is
+            // nothing left to compare against. A full index re-emits every
+            // node it already knows, so without this every reindex would read
+            // as the whole workspace changing at once.
+            if gn.label != node.label || gn.props != node.props {
+                moved = Some((node.id.clone(), Stir::Changed));
+            }
             gn.label = node.label;
             gn.props = node.props;
             gn.kind = node.kind;
             gn.repo_id = node.repo_id;
             gn.path = node.path;
         }
-        return;
+        return moved;
     }
     let anchor = parent_pos(graph, &node.id, existing).unwrap_or(Vec2::ZERO);
     let angle = hash01(node.id.as_str(), 1) * std::f32::consts::TAU;
@@ -264,8 +353,10 @@ fn upsert_node(
         ))
         .id();
     spawn_node_visuals(commands, entity, &node, ws, v);
-    graph.by_id.insert(node.id, entity);
+    graph.ids.insert(entity, node.id.clone());
+    graph.by_id.insert(node.id.clone(), entity);
     graph.node_count += 1;
+    Some((node.id, Stir::Appeared))
 }
 
 fn remove_node(commands: &mut Commands, graph: &mut GraphState, id: &NodeId) {
@@ -282,6 +373,7 @@ fn remove_node(commands: &mut Commands, graph: &mut GraphState, id: &NodeId) {
         remove_edge(commands, graph, &k);
     }
     graph.degree.remove(&entity);
+    graph.ids.remove(&entity);
     graph.adjacency.remove(id);
     graph.parent.remove(id);
     graph.pending_edges.retain(|e| &e.src != id && &e.dst != id);
@@ -291,7 +383,19 @@ fn remove_node(commands: &mut Commands, graph: &mut GraphState, id: &NodeId) {
 
 fn add_edge(commands: &mut Commands, graph: &mut GraphState, edge: Edge) {
     let key: EdgeKey = (edge.kind.clone(), edge.src.clone(), edge.dst.clone());
-    if graph.edges.contains_key(&key) {
+    if let Some(&existing) = graph.edges.get(&key) {
+        // The edge is already drawn, but its props may have moved on — a live
+        // session touches the same file again and the time changes. Overwrite
+        // the component without re-running the grow-in animation.
+        if let (Some(&s), Some(&d)) = (graph.by_id.get(&edge.src), graph.by_id.get(&edge.dst)) {
+            commands.entity(existing).insert(GraphEdge {
+                seed: seed_of(&format!("{}{}{}", edge.kind, edge.src, edge.dst)),
+                kind: edge.kind,
+                props: edge.props,
+                src: s,
+                dst: d,
+            });
+        }
         return;
     }
     let (Some(&s), Some(&d)) = (graph.by_id.get(&edge.src), graph.by_id.get(&edge.dst)) else {
@@ -311,6 +415,7 @@ fn add_edge(commands: &mut Commands, graph: &mut GraphState, edge: Edge) {
                 src: s,
                 dst: d,
                 seed,
+                props: edge.props.clone(),
             },
             GrowIn { t: 0.0, dur: 0.6 },
         ))

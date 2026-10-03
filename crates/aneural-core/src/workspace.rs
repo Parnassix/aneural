@@ -82,6 +82,24 @@ impl Workspace {
     pub fn db_path(&self) -> PathBuf {
         self.cache_dir().join("index.db")
     }
+    /// The run journal: committed, append-only, one directory per machine.
+    ///
+    /// Outside `cache/` and `state/` on purpose — this is the one part of the
+    /// run story that is meant to travel, so a colleague pulling the repository
+    /// sees that the nightly job has been failing since Tuesday.
+    pub fn runs_dir(&self) -> PathBuf {
+        self.aneural_dir().join("runs")
+    }
+    /// The index built from the journal. Derived, gitignored, and deliberately
+    /// its own file rather than a table in [`Workspace::db_path`]: that one is
+    /// dropped whenever the graph's shape changes, and run history must not be
+    /// lost because a node kind was added.
+    pub fn runs_db_path(&self) -> PathBuf {
+        self.cache_dir().join("runs.db")
+    }
+    pub fn gitattributes_path(&self) -> PathBuf {
+        self.aneural_dir().join(".gitattributes")
+    }
 
     /// Workspace-relative canonical path for an absolute path inside the workspace.
     pub fn rel(&self, abs: &Path) -> Option<String> {
@@ -135,6 +153,7 @@ impl Workspace {
         if !gi.exists() {
             std::fs::write(&gi, "cache/\nstate/\n")?;
         }
+        write_gitattributes(&self.gitattributes_path())?;
         let icebox = self.icebox_dir().join("ideas.md");
         if !icebox.exists() {
             std::fs::write(
@@ -256,6 +275,38 @@ pub fn merge_node_type(defs: &mut Vec<NodeTypeDef>, def: NodeTypeDef) {
     } else {
         defs.push(def);
     }
+}
+
+/// The merge rule the run journal needs, written into `.aneural/.gitattributes`.
+///
+/// `merge=union` is built into git and it is *correct* here rather than merely
+/// convenient: the journal is append-only, so two machines' lines are both true
+/// and keeping all of them is the right resolution. Duplicates that a union
+/// merge leaves behind are collapsed when the journal is indexed, which is why
+/// a run id is derived from its content rather than randomly assigned.
+///
+/// Only ever adds the line, never rewrites the file: a workspace may have put
+/// its own rules here.
+pub fn write_gitattributes(path: &Path) -> Result<()> {
+    const RULE: &str = "runs/**/*.jsonl merge=union";
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == RULE) {
+        return Ok(());
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if out.is_empty() {
+        out.push_str("# The run journal is append-only: every machine's lines are true.\n");
+    }
+    out.push_str(RULE);
+    out.push('\n');
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, out)?;
+    Ok(())
 }
 
 /// Write via temp file + rename so readers never observe a partial file.

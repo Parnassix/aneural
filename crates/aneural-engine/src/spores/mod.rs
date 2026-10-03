@@ -43,6 +43,12 @@ pub const BUILTIN_SPORES: &[(&str, &str)] = &[
         "github",
         include_str!("../../../../spores/github/spore.json"),
     ),
+    // Off by default: a repository of scripts grows a node per script, which is
+    // hundreds in a workspace built around them. Worth opting into.
+    (
+        "scripts",
+        include_str!("../../../../spores/scripts/spore.json"),
+    ),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +78,35 @@ struct CompiledHarvester {
 }
 
 impl Spore {
+    /// Node kinds this spore emits without an origin — an unresolved wiki-link
+    /// placeholder, a tag.
+    ///
+    /// Those nodes belong to no one file, so nothing retracts them when a file
+    /// changes and the caller has to collect them by kind once nothing points
+    /// at them any more.
+    pub fn shared_node_kinds(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut add = |kind: &String| {
+            if !out.contains(kind) {
+                out.push(kind.clone());
+            }
+        };
+        for h in &self.harvesters {
+            if let Harvester::Markdown {
+                wikilinks, tags, ..
+            } = &h.def
+            {
+                if let Some(spec) = wikilinks.as_ref().and_then(|w| w.unresolved.as_ref()) {
+                    add(&spec.kind);
+                }
+                if let Some(t) = tags {
+                    add(&t.node.kind);
+                }
+            }
+        }
+        out
+    }
+
     /// A summary for the CLI, the GUI and MCP. `settings` is the workspace's
     /// answers, so the caller learns which required ones are still blank.
     pub fn info_with(&self, settings: &BTreeMap<String, String>) -> SporeInfo {
@@ -351,17 +386,30 @@ pub fn load_all(ws: &Workspace, enabled: &[String]) -> (Vec<Spore>, Vec<SporeErr
 #[derive(Default, Clone)]
 pub struct MarkdownIndex {
     by_stem: HashMap<String, Vec<String>>,
+    /// Names a note answers to besides its filename, from its frontmatter.
+    /// Kept apart from `by_stem` so a real file always wins over an alias.
+    by_alias: HashMap<String, Vec<String>>,
 }
 
 impl MarkdownIndex {
     pub fn insert(&mut self, rel: &str) {
         if let Some(stem) = stem_of(rel) {
-            let v = self.by_stem.entry(stem).or_default();
-            if !v.iter().any(|p| p == rel) {
-                v.push(rel.to_string());
-                v.sort();
+            push_unique(self.by_stem.entry(stem).or_default(), rel);
+        }
+    }
+
+    /// Record the `aliases:` a note declares, replacing any it declared before.
+    pub fn insert_aliases(&mut self, rel: &str, aliases: &[String]) {
+        for v in self.by_alias.values_mut() {
+            v.retain(|p| p != rel);
+        }
+        for a in aliases {
+            let key = normalise(a);
+            if !key.is_empty() {
+                push_unique(self.by_alias.entry(key).or_default(), rel);
             }
         }
+        self.by_alias.retain(|_, v| !v.is_empty());
     }
 
     pub fn remove(&mut self, rel: &str) {
@@ -370,13 +418,21 @@ impl MarkdownIndex {
         {
             v.retain(|p| p != rel);
         }
+        for v in self.by_alias.values_mut() {
+            v.retain(|p| p != rel);
+        }
+        self.by_alias.retain(|_, v| !v.is_empty());
     }
 
     /// Prefer a file in the same directory as `from`, then the shortest path.
+    ///
+    /// The link text may carry a path (`[[../../Notes|Notes]]` is what Obsidian
+    /// writes when a link crosses folders), but resolution is by name: that
+    /// path is Obsidian's own bookkeeping and goes stale the moment a note is
+    /// moved, whereas the name is what the author typed.
     pub fn resolve(&self, target: &str, from: &str) -> Option<String> {
-        let key = target.trim().trim_end_matches(".md").to_lowercase();
-        let key = key.rsplit('/').next().unwrap_or(&key).to_string();
-        let candidates = self.by_stem.get(&key)?;
+        let key = normalise(target);
+        let candidates = self.by_stem.get(&key).or_else(|| self.by_alias.get(&key))?;
         let from_dir = from.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         candidates
             .iter()
@@ -384,6 +440,20 @@ impl MarkdownIndex {
             .or_else(|| candidates.iter().min_by_key(|c| c.len()))
             .cloned()
     }
+}
+
+fn push_unique(v: &mut Vec<String>, rel: &str) {
+    if !v.iter().any(|p| p == rel) {
+        v.push(rel.to_string());
+        v.sort();
+    }
+}
+
+/// A link target or an alias reduced to the key both sides of the index use.
+fn normalise(name: &str) -> String {
+    let lower = name.trim().trim_end_matches(".md").to_lowercase();
+    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    base.trim().to_string()
 }
 
 fn stem_of(rel: &str) -> Option<String> {
@@ -465,9 +535,9 @@ pub fn harvest_file(
         let src = Source::spore(&spore.manifest.id());
         for h in spore.harvesters.iter().filter(|h| h.matches(rel)) {
             match &h.def {
-                Harvester::Regex { emit, .. } => {
+                Harvester::Regex { emit, once, .. } => {
                     let re = h.regex.as_ref().expect("compiled regex");
-                    harvest_regex(re, emit, &src, rel, &text, &mut out);
+                    harvest_regex(re, emit, *once, &src, rel, &text, &mut out);
                 }
                 Harvester::TreeSitter {
                     language,
@@ -482,6 +552,8 @@ pub fn harvest_file(
                     emit,
                     wikilinks,
                     annotate,
+                    tags,
+                    table,
                     ..
                 } => {
                     harvest_markdown(
@@ -489,6 +561,8 @@ pub fn harvest_file(
                         emit.as_ref(),
                         wikilinks.as_ref(),
                         annotate.as_ref(),
+                        tags.as_ref(),
+                        table.as_ref(),
                         &src,
                         rel,
                         &text,
@@ -521,9 +595,61 @@ pub fn harvest_file(
     out
 }
 
+/// A node that belongs to no single file.
+///
+/// Emitted with **no origin**, so `replace_origin` never retracts it when one
+/// of the files pointing at it changes; `Store::gc_orphan_by_kind` collects it
+/// once nothing points at it at all. The same arrangement as a `Package`.
+fn shared_node(
+    spec: &aneural_core::spore::EmitNode,
+    source: &str,
+    v: &Vars,
+    fallback_label: &str,
+) -> Option<Node> {
+    let id = NodeId::parse(&render(&spec.id, v)).ok()?;
+    let mut node = Node::new(
+        id,
+        spec.kind.clone(),
+        render(&spec.label, v).trim().to_string(),
+        source,
+    );
+    if node.label.is_empty() {
+        node.label = fallback_label.to_string();
+    }
+    if let serde_json::Value::Object(map) = &mut node.props {
+        for (k, tpl) in &spec.props {
+            let rendered = render(tpl, v);
+            if !rendered.is_empty() {
+                map.insert(k.clone(), coerce(&rendered));
+            }
+        }
+    }
+    Some(node)
+}
+
+/// Collapse repeats within one file's harvest.
+///
+/// Two harvesters describing the same thing from different places is a
+/// composition pattern, not a mistake: one reads a script's id out of a module
+/// constant, another notices which CLI library it imports, and together they
+/// describe one script. So a later node **fills in props the first one did not
+/// have** rather than being dropped. It never overwrites: the first writer owns
+/// the kind, the label and every prop it set, so the result does not depend on
+/// which order the harvesters happen to run in.
 fn dedupe(h: &mut Harvest) {
-    let mut seen = std::collections::HashSet::new();
-    h.nodes.retain(|n| seen.insert(n.id.clone()));
+    let mut at: std::collections::HashMap<NodeId, usize> = std::collections::HashMap::new();
+    let mut merged: Vec<Node> = Vec::with_capacity(h.nodes.len());
+    for node in std::mem::take(&mut h.nodes) {
+        match at.get(&node.id) {
+            Some(&i) => fill_props(&mut merged[i], node),
+            None => {
+                at.insert(node.id.clone(), merged.len());
+                merged.push(node);
+            }
+        }
+    }
+    h.nodes = merged;
+
     let mut seen_e = std::collections::HashSet::new();
     h.edges.retain(|e| {
         seen_e.insert((
@@ -533,6 +659,19 @@ fn dedupe(h: &mut Harvest) {
             e.source.clone(),
         ))
     });
+}
+
+/// Add whatever `later` says that `kept` does not already say.
+fn fill_props(kept: &mut Node, later: Node) {
+    let serde_json::Value::Object(extra) = later.props else {
+        return;
+    };
+    let serde_json::Value::Object(into) = &mut kept.props else {
+        return;
+    };
+    for (key, value) in extra {
+        into.entry(key).or_insert(value);
+    }
 }
 
 pub(crate) fn base_vars(rel: &str) -> Vars {
@@ -601,7 +740,15 @@ pub(crate) fn emit_node(
     Some(id)
 }
 
-fn harvest_regex(re: &Regex, emit: &Emit, source: &str, rel: &str, text: &str, out: &mut Harvest) {
+fn harvest_regex(
+    re: &Regex,
+    emit: &Emit,
+    once: bool,
+    source: &str,
+    rel: &str,
+    text: &str,
+    out: &mut Harvest,
+) {
     for (i, line) in text.lines().enumerate() {
         if let Some(caps) = re.captures(line) {
             let mut vars = base_vars(rel);
@@ -618,6 +765,9 @@ fn harvest_regex(re: &Regex, emit: &Emit, source: &str, rel: &str, text: &str, o
                 }
             }
             emit_node(emit, source, rel, &vars, out);
+            if once {
+                return;
+            }
         }
     }
 }
@@ -653,6 +803,8 @@ fn harvest_markdown(
     emit: Option<&Emit>,
     wikilinks: Option<&aneural_core::spore::WikiLinks>,
     annotate: Option<&aneural_core::spore::Annotate>,
+    tags: Option<&aneural_core::spore::Tags>,
+    table: Option<&aneural_core::spore::TableSelect>,
     source: &str,
     rel: &str,
     text: &str,
@@ -691,6 +843,67 @@ fn harvest_markdown(
                     .with_prop("via", "wikilink")
                     .with_prop("line", line as i64),
             );
+            return;
+        }
+        // Nothing of that name exists. The note was still asked for, and by how
+        // many callers, which is worth more than a dropped edge.
+        let Some(spec) = &wl.unresolved else { return };
+        let label = target.trim();
+        let slug = aneural_core::slug(label);
+        if slug.is_empty() {
+            return;
+        }
+        let mut v: Vars = Vars::new();
+        v.insert("target".into(), label.to_string());
+        v.insert("slug".into(), slug);
+        let Some(mut node) = shared_node(spec, source, &v, label) else {
+            return;
+        };
+        let dst = node.id.clone();
+        if &dst == from {
+            return;
+        }
+        if let serde_json::Value::Object(map) = &mut node.props {
+            // Stamped by the engine, not the manifest: a reader has to be able
+            // to tell a placeholder from a real node without knowing which
+            // spore made it or what it chose to call the kind.
+            map.insert("unresolved".into(), true.into());
+        }
+        out.nodes.push(node);
+        out.edges.push(
+            Edge::new(wl.edge_kind.clone(), from.clone(), dst, source)
+                .with_origin(rel)
+                .with_prop("via", "unresolved")
+                .with_prop("line", line as i64),
+        );
+    };
+
+    // Frontmatter tags. A tag is a name many files share, so like a missing
+    // note it is one node with no origin rather than one per file — which is
+    // also what makes "everything tagged fda" a thing you can see.
+    let tag_edges = |from: &NodeId, out: &mut Harvest| {
+        let Some(t) = tags else { return };
+        for tag in markdown::declared_list(&doc.frontmatter, &t.frontmatter_key) {
+            let slug = aneural_core::slug(&tag);
+            if slug.is_empty() {
+                continue;
+            }
+            let mut v: Vars = Vars::new();
+            v.insert("tag".into(), tag.clone());
+            v.insert("slug".into(), slug);
+            let Some(node) = shared_node(&t.node, source, &v, &tag) else {
+                continue;
+            };
+            let dst = node.id.clone();
+            if &dst == from {
+                continue;
+            }
+            out.nodes.push(node);
+            out.edges.push(
+                Edge::new(t.edge_kind.clone(), from.clone(), dst, source)
+                    .with_origin(rel)
+                    .with_prop("via", "tag"),
+            );
         }
     };
 
@@ -703,6 +916,7 @@ fn harvest_markdown(
             for l in &doc.links {
                 link_edge(&anchor, &l.target, l.line, out);
             }
+            tag_edges(&anchor, out);
             if let (Some(a), Some(_)) = (annotate, emit)
                 && let Some(targets) = doc.frontmatter.lists.get(&a.frontmatter_key)
             {
@@ -717,6 +931,9 @@ fn harvest_markdown(
             }
         }
         MarkdownGranularity::Heading => {
+            // Frontmatter describes the document, so its tags attach to the
+            // file rather than being copied onto every heading in it.
+            tag_edges(&file_id, out);
             let Some(e) = emit else { return };
             let mut names: BTreeMap<String, usize> = BTreeMap::new();
             for (i, section) in doc.sections.iter().enumerate() {
@@ -735,6 +952,38 @@ fn harvest_markdown(
                     let next = doc.sections.get(i + 1).map(|s| s.line);
                     for l in markdown::links_in(&doc, section, next) {
                         link_edge(&id, &l.target, l.line, out);
+                    }
+                }
+            }
+        }
+        MarkdownGranularity::TableRow => {
+            // As with headings, frontmatter describes the document, so its tags
+            // attach to the file rather than to every row of every table.
+            tag_edges(&file_id, out);
+            let Some(e) = emit else { return };
+            let required = table.map(|t| t.requires.as_slice()).unwrap_or(&[]);
+            for t in markdown::tables(&doc) {
+                if !t.has_columns(required) {
+                    continue;
+                }
+                for row in &t.rows {
+                    let mut v = vars.clone();
+                    v.insert("table".into(), t.heading.clone());
+                    v.insert("headers".into(), t.headers.join(", "));
+                    v.insert("row".into(), row.row.to_string());
+                    v.insert("line".into(), row.line.to_string());
+                    for (key, text) in &row.cells {
+                        v.insert(format!("col.{key}"), text.clone());
+                    }
+                    for (i, text) in row.positional.iter().enumerate() {
+                        v.insert(format!("col.{}", i + 1), text.clone());
+                    }
+                    if let Some(id) = emit_node(e, source, rel, &v, out) {
+                        // A link written in a cell is about that row, not about
+                        // the document, so it hangs off the row's own node.
+                        for l in doc.links.iter().filter(|l| l.line == row.line) {
+                            link_edge(&id, &l.target, l.line, out);
+                        }
                     }
                 }
             }
@@ -858,6 +1107,194 @@ mod tests {
         assert_eq!(h.nodes[0].origin.as_deref(), Some("src/a.ts"));
     }
 
+    /// Only the `scripts` spore, so a script's nodes are not mixed with a
+    /// comment harvested from the same bytes.
+    fn scripts_only() -> Vec<Spore> {
+        BUILTIN_SPORES
+            .iter()
+            .filter(|(name, _)| *name == "scripts")
+            .map(|(name, json)| {
+                compile(serde_json::from_str(json).unwrap(), "builtin", name, true).unwrap()
+            })
+            .collect()
+    }
+
+    fn harvest(spores: &[Spore], rel: &str, src: &[u8]) -> Harvest {
+        harvest_file(
+            spores,
+            &MarkdownIndex::default(),
+            rel,
+            std::path::Path::new(rel),
+            src,
+        )
+    }
+
+    #[test]
+    fn a_file_in_a_scripts_directory_is_a_script_even_with_no_shebang() {
+        // The shape of the repository this was written for: 206 Python files in
+        // `scripts/`, 128 of them with no shebang and not one marked
+        // executable, all run as `uv run python scripts/<name>.py`.
+        let h = harvest(
+            &scripts_only(),
+            "acme-ingest/scripts/download_pubmed.py",
+            b"\"\"\"Download PubMed update files.\"\"\"\nSOURCE_ID = \"pubmed_updates\"\n",
+        );
+        assert_eq!(h.nodes.len(), 1, "{:?}", h.nodes);
+        let n = &h.nodes[0];
+        assert_eq!(n.kind, "Script");
+        assert_eq!(
+            n.id,
+            NodeId::script("acme-ingest/scripts/download_pubmed.py", None)
+        );
+        assert_eq!(n.label, "download_pubmed");
+        assert_eq!(n.props["found"], "directory");
+        assert!(n.props.get("interpreter").is_none());
+
+        // and it is tethered to the file it was found in
+        assert_eq!(h.edges.len(), 1);
+        assert_eq!(h.edges[0].kind, "REFERENCES");
+        assert_eq!(
+            h.edges[0].dst,
+            NodeId::file("acme-ingest/scripts/download_pubmed.py")
+        );
+        assert_eq!(h.edges[0].props["via"], "source");
+    }
+
+    #[test]
+    fn two_harvesters_finding_one_script_describe_it_together() {
+        // `shebang` and `script-directory` both emit `script:{file}`. Before
+        // dedupe merged props the second was silently dropped, so whichever
+        // harvester happened to run second contributed nothing.
+        let h = harvest(
+            &scripts_only(),
+            "bin/release",
+            b"#!/usr/bin/env bash\nset -euo pipefail\n",
+        );
+        assert_eq!(h.nodes.len(), 1, "one script, not two: {:?}", h.nodes);
+        let n = &h.nodes[0];
+        // the first writer owns `found`, the second still contributes what it knows
+        assert_eq!(n.props["found"], "shebang");
+        assert_eq!(n.props["interpreter"], "/usr/bin/env");
+        assert_eq!(n.label, "release");
+        assert_eq!(h.edges.len(), 1, "and the edge is not doubled");
+    }
+
+    #[test]
+    fn a_document_next_to_the_scripts_is_not_a_script() {
+        let spores = scripts_only();
+        for rel in [
+            "scripts/README.md",
+            "scripts/requirements.txt",
+            "scripts/config.json",
+            "bin/logo.svg",
+        ] {
+            let h = harvest(&spores, rel, b"anything at all\n");
+            assert!(h.nodes.is_empty(), "{rel} became {:?}", h.nodes);
+        }
+    }
+
+    #[test]
+    fn a_crontab_line_and_a_workflow_cron_both_become_schedules() {
+        let spores = scripts_only();
+        let h = harvest(
+            &spores,
+            "deploy/crontab",
+            b"# comment\n0 4 * * * /usr/local/bin/ingest --since=yesterday\n*/15 * * * * ping\n",
+        );
+        assert_eq!(h.nodes.len(), 2, "{:?}", h.nodes);
+        assert_eq!(h.nodes[0].kind, "Schedule");
+        assert_eq!(h.nodes[0].props["cron"], "0 4 * * *");
+        assert_eq!(
+            h.nodes[0].props["command"],
+            "/usr/local/bin/ingest --since=yesterday"
+        );
+        assert_eq!(h.nodes[0].props["declaredBy"], "crontab");
+        assert_eq!(h.nodes[0].props["line"], 2);
+        assert_eq!(h.nodes[1].props["cron"], "*/15 * * * *");
+        assert_eq!(h.edges[0].props["via"], "declared");
+
+        let h = harvest(
+            &spores,
+            ".github/workflows/nightly.yml",
+            b"on:\n  schedule:\n    - cron: '0 3 * * *'\n",
+        );
+        assert_eq!(h.nodes.len(), 1, "{:?}", h.nodes);
+        assert_eq!(h.nodes[0].props["cron"], "0 3 * * *");
+        assert_eq!(h.nodes[0].props["declaredBy"], "github-actions");
+        assert_eq!(h.nodes[0].props["workflow"], "nightly");
+    }
+
+    #[test]
+    fn a_table_of_cadences_becomes_a_schedule_per_row() {
+        // The per-project half: a workspace spore reads a project's own table.
+        // Two tables in one file, keyed the same way, describe one schedule
+        // between them.
+        let spore = r##"{
+          "publisher": "acme", "name": "cadences", "version": "0.1.0",
+          "harvesters": [
+            {
+              "id": "index", "kind": "markdown", "include": ["**/Cadences.md"],
+              "granularity": "table-row",
+              "table": { "requires": ["source_id", "cadence"] },
+              "emit": { "node": {
+                "kind": "Schedule", "id": "acme.cadences.schedule:{file}#{slug(col.source_id)}",
+                "label": "{col.source_id}",
+                "props": { "cadence": "{col.cadence}", "lastRefreshed": "{col.last_refreshed}" }
+              }, "edges": [
+                { "kind": "ANNOTATES", "src": "$node",
+                  "dst": "script:scripts/download_{col.source_id}.py",
+                  "props": { "via": "schedule" } }
+              ] }
+            },
+            {
+              "id": "shapes", "kind": "markdown", "include": ["**/Cadences.md"],
+              "granularity": "table-row",
+              "table": { "requires": ["source_id", "refresh_shape"] },
+              "emit": { "node": {
+                "kind": "Schedule", "id": "acme.cadences.schedule:{file}#{slug(col.source_id)}",
+                "label": "{col.source_id}",
+                "props": { "refreshShape": "{col.refresh_shape}" }
+              } }
+            }
+          ]
+        }"##;
+        let (spores, errs) = load_with(&["acme.cadences"], &[("cadences", spore)]);
+        assert!(errs.is_empty(), "{errs:?}");
+
+        let src = concat!(
+            "## The index\n\n",
+            "| source_id | cadence | last_refreshed |\n",
+            "|---|---|---|\n",
+            "| `aact` | daily | 2026-06-07 |\n",
+            "| `gdelt` | weekly-mon | 2026-06-01 |\n\n",
+            "## Refresh shapes\n\n",
+            "| source_id | refresh_shape |\n",
+            "|---|---|\n",
+            "| `aact` | full-re-pull |\n",
+        );
+        let h = harvest(&spores, "docs/Cadences.md", src.as_bytes());
+
+        assert_eq!(h.nodes.len(), 2, "one per source_id: {:?}", h.nodes);
+        let aact = h.nodes.iter().find(|n| n.label == "aact").expect("aact");
+        assert_eq!(aact.props["cadence"], "daily");
+        assert_eq!(aact.props["lastRefreshed"], "2026-06-07");
+        // the second table's column arrived without displacing the first's
+        assert_eq!(aact.props["refreshShape"], "full-re-pull");
+
+        let gdelt = h.nodes.iter().find(|n| n.label == "gdelt").unwrap();
+        assert_eq!(gdelt.props["cadence"], "weekly-mon");
+        assert!(
+            gdelt.props.get("refreshShape").is_none(),
+            "not in that table"
+        );
+
+        // each row is tethered to the script its key names
+        assert!(h.edges.iter().any(
+            |e| e.dst == NodeId::script("scripts/download_aact.py", None)
+                && e.props["via"] == "schedule"
+        ));
+    }
+
     #[test]
     fn plans_and_icebox_and_links() {
         let spores = builtins();
@@ -932,6 +1369,177 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn a_link_resolves_by_name_through_a_stale_path_or_an_alias() {
+        let mut idx = MarkdownIndex::default();
+        idx.insert("README.md");
+        idx.insert("docs/Architecture Decision Records.md");
+        idx.insert_aliases(
+            "docs/Architecture Decision Records.md",
+            &["ADR".into(), "Decision Log".into()],
+        );
+
+        // Obsidian writes the path it saw at the time; the name is what the
+        // author typed, and it is the name that survives a move.
+        assert_eq!(
+            idx.resolve("../../README", "docs/deep/x.md").as_deref(),
+            Some("README.md")
+        );
+        // An alias is a name the note answers to.
+        assert_eq!(
+            idx.resolve("adr", "README.md").as_deref(),
+            Some("docs/Architecture Decision Records.md")
+        );
+        assert_eq!(
+            idx.resolve("Decision Log", "README.md").as_deref(),
+            Some("docs/Architecture Decision Records.md")
+        );
+
+        // A real file of that name always beats somebody else's alias.
+        idx.insert("notes/ADR.md");
+        assert_eq!(
+            idx.resolve("ADR", "README.md").as_deref(),
+            Some("notes/ADR.md")
+        );
+
+        // Re-declaring replaces: the old alias stops resolving.
+        idx.insert_aliases(
+            "docs/Architecture Decision Records.md",
+            &["Decisions".into()],
+        );
+        assert_eq!(idx.resolve("Decision Log", "README.md"), None);
+        assert_eq!(
+            idx.resolve("Decisions", "README.md").as_deref(),
+            Some("docs/Architecture Decision Records.md")
+        );
+
+        // And a deleted note takes its aliases with it.
+        idx.remove("docs/Architecture Decision Records.md");
+        assert_eq!(idx.resolve("Decisions", "README.md"), None);
+    }
+
+    #[test]
+    fn a_link_to_a_note_nobody_wrote_is_kept_as_a_placeholder() {
+        let spores = builtins();
+        let mut idx = MarkdownIndex::default();
+        idx.insert("README.md");
+        idx.insert(".aneural/notes/Architecture.md");
+
+        let note = b"# Architecture\n\nSee [[README]] and [[Not Written Yet]].\n";
+        let h = harvest_file(
+            &spores,
+            &idx,
+            ".aneural/notes/Architecture.md",
+            std::path::Path::new(".aneural/notes/Architecture.md"),
+            note,
+        );
+
+        let missing: Vec<_> = h.nodes.iter().filter(|n| n.kind == "MissingNote").collect();
+        assert_eq!(
+            missing.len(),
+            1,
+            "one per distinct target, not one per link"
+        );
+        let m = missing[0];
+        assert_eq!(m.id, NodeId::new("missing:not-written-yet"));
+        assert_eq!(m.label, "Not Written Yet");
+        assert_eq!(m.props["target"], "Not Written Yet");
+        // Recognisable as a placeholder without knowing the spore or the kind.
+        assert_eq!(m.props["unresolved"], true);
+        // Shared by every file that asks for it, so owned by none of them.
+        assert!(
+            m.origin.is_none(),
+            "a placeholder must outlive the file that named it"
+        );
+
+        assert!(
+            h.edges
+                .iter()
+                .any(|e| e.dst == m.id && e.props["via"] == "unresolved")
+        );
+        // The link that did resolve is unaffected and still points at the file.
+        assert!(
+            h.edges
+                .iter()
+                .any(|e| e.dst == NodeId::file("README.md") && e.props["via"] == "wikilink")
+        );
+        // No placeholder for a target that exists.
+        assert!(!h.nodes.iter().any(|n| n.label == "README"));
+    }
+
+    #[test]
+    fn frontmatter_tags_become_one_shared_node_each() {
+        let spores = builtins();
+        let mut idx = MarkdownIndex::default();
+        idx.insert("Data Sources/FDA 510k.md");
+
+        // The shape every note in a real vault uses.
+        let note = b"---\ntags: [data-source, medical-device, FDA]\n---\n# FDA 510k\n";
+        let h = harvest_file(
+            &spores,
+            &idx,
+            "Data Sources/FDA 510k.md",
+            std::path::Path::new("Data Sources/FDA 510k.md"),
+            note,
+        );
+
+        let tags: Vec<&Node> = h.nodes.iter().filter(|n| n.kind == "Tag").collect();
+        let mut ids: Vec<&str> = tags.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["tag:data-source", "tag:fda", "tag:medical-device"]);
+
+        // The id is slugged so `FDA` and `fda` are one tag, but the label keeps
+        // what the author typed.
+        let fda = tags.iter().find(|n| n.id.as_str() == "tag:fda").unwrap();
+        assert_eq!(fda.label, "FDA");
+        assert_eq!(fda.props["tag"], "FDA");
+        assert!(
+            fda.origin.is_none(),
+            "a tag is shared by every file carrying it"
+        );
+
+        for id in ids {
+            assert!(
+                h.edges
+                    .iter()
+                    .any(|e| e.src == NodeId::file("Data Sources/FDA 510k.md")
+                        && e.dst.as_str() == id
+                        && e.props["via"] == "tag"),
+                "{id} is joined to the file that carries it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tag_list_is_read_however_it_was_written() {
+        let spores = builtins();
+        let idx = MarkdownIndex::default();
+        let tags_of = |body: &str| {
+            let h = harvest_file(
+                &spores,
+                &idx,
+                "n.md",
+                std::path::Path::new("n.md"),
+                body.as_bytes(),
+            );
+            let mut v: Vec<String> = h
+                .nodes
+                .iter()
+                .filter(|n| n.kind == "Tag")
+                .map(|n| n.id.to_string())
+                .collect();
+            v.sort();
+            v
+        };
+
+        let want = vec!["tag:a".to_string(), "tag:b".to_string()];
+        assert_eq!(tags_of("---\ntags: [a, b]\n---\n"), want, "inline");
+        assert_eq!(tags_of("---\ntags:\n  - a\n  - b\n---\n"), want, "block");
+        assert_eq!(tags_of("---\ntags: a, b\n---\n"), want, "bare");
+        assert!(tags_of("---\ntags:\n---\n").is_empty(), "empty key");
+        assert!(tags_of("# no frontmatter\n").is_empty());
     }
 
     #[test]

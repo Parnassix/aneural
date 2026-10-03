@@ -1,0 +1,17 @@
+[package]
+name = "aneural-git"
+description = "Reads a repository's own history into Aneural nodes and edges"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gix.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

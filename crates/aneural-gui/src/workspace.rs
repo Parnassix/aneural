@@ -83,6 +83,14 @@ pub fn node_radius(kind: &str) -> f32 {
         "Directory" => 11.0,
         "Manifest" => 10.0,
         "File" | "Package" => 8.0,
+        // A tag is a label many files share, and a vault has a hundred of
+        // them; a note nobody wrote is smaller still than a note.
+        "Tag" => 6.0,
+        // A schedule and a run are satellites of the script they are about, and
+        // a repository of scripts has one of each per script; at 7.0 they
+        // out-shout the file tree they hang off.
+        "Schedule" | "Run" => 6.0,
+        "MissingNote" => 5.0,
         _ => 7.0,
     }
 }

@@ -57,6 +57,81 @@ impl NodeId {
         NodeId(format!("plan:{}", canonical_rel(rel.as_ref())))
     }
 
+    /// A plan that lives outside the workspace, under the user's home — e.g.
+    /// `plan:~/.claude/plans/wise-phoenix.md`. The leading `~/` is a segment
+    /// `canonical_rel` can never produce, so these can never collide with a
+    /// workspace plan of the same name.
+    pub fn home_plan(name: &str) -> Self {
+        NodeId(format!("plan:~/.claude/plans/{name}"))
+    }
+
+    /// `usage:workspace`, or `usage:repo/<rel>` — a tally of what was spent
+    /// working somewhere. Not path-derived: a tally is about a place rather
+    /// than being a thing at one, and `usage:repo/.` has to stay distinct from
+    /// the workspace total even when the root is itself the only repository.
+    pub fn usage(scope: &str) -> Self {
+        NodeId(format!("usage:{scope}"))
+    }
+
+    /// The tally for one repository, named by its workspace-relative root.
+    pub fn repo_usage(repo_rel: impl AsRef<Path>) -> Self {
+        NodeId::usage(&format!("repo/{}", canonical_rel(repo_rel.as_ref())))
+    }
+
+    /// The tally for everything in the workspace.
+    pub fn workspace_usage() -> Self {
+        NodeId::usage("workspace")
+    }
+
+    /// `session:<uuid>` — one Claude Code session. Not path-derived: the
+    /// transcript lives outside the workspace.
+    pub fn session(uuid: &str) -> Self {
+        NodeId(format!("session:{uuid}"))
+    }
+
+    /// `commit:<repo rel>@<sha>` — scoped by repo because a workspace can hold
+    /// several, and two of them can legitimately share a sha after a fork.
+    pub fn commit(repo_rel: impl AsRef<Path>, sha: &str) -> Self {
+        NodeId(format!("commit:{}@{sha}", canonical_rel(repo_rel.as_ref())))
+    }
+
+    /// `script:scripts/download_pubmed.py`, or `script:package.json#build` when
+    /// one file declares several runnable entries.
+    pub fn script(rel: impl AsRef<Path>, entry: Option<&str>) -> Self {
+        NodeId::custom("script", rel, entry)
+    }
+
+    /// A schedule *declared in a workspace file*: `schedule:<rel>#<key>`. The
+    /// key is what the declaration is about, so two rows of one table become
+    /// two schedules rather than overwriting each other.
+    pub fn schedule(rel: impl AsRef<Path>, key: &str) -> Self {
+        NodeId(format!(
+            "schedule:{}#{}",
+            canonical_rel(rel.as_ref()),
+            crate::slug(key)
+        ))
+    }
+
+    /// A schedule this machine's launchd or crontab actually has —
+    /// `schedule:~/installed/<label>`. The leading `~/` is the [`Self::home_plan`]
+    /// trick: a segment `canonical_rel` can never produce, so a machine-local
+    /// schedule can never collide with one declared in a file.
+    pub fn installed_schedule(label: &str) -> Self {
+        NodeId(format!("schedule:~/installed/{label}"))
+    }
+
+    /// A schedule Aneural itself manages, from config: `schedule:~/managed/<key>`.
+    pub fn managed_schedule(script_key: &str) -> Self {
+        NodeId(format!("schedule:~/managed/{script_key}"))
+    }
+
+    /// The latest run of one script, mirroring that script's own id. Stable for
+    /// the life of the script: a run-derived id would replace the node on every
+    /// fire, and the graph would churn an entity each time.
+    pub fn run(rel: impl AsRef<Path>, entry: Option<&str>) -> Self {
+        NodeId::custom("run", rel, entry)
+    }
+
     pub fn note(rel: impl AsRef<Path>) -> Self {
         NodeId(format!("note:{}", canonical_rel(rel.as_ref())))
     }
@@ -187,5 +262,44 @@ mod tests {
         );
         assert!(NodeId::parse("nope").is_err());
         assert!(NodeId::parse("file:a").is_ok());
+    }
+
+    #[test]
+    fn a_runnable_entry_inside_a_file_is_distinct_from_the_file_itself() {
+        assert_eq!(
+            NodeId::script("./scripts/download_pubmed.py", None).as_str(),
+            "script:scripts/download_pubmed.py"
+        );
+        assert_eq!(
+            NodeId::script("package.json", Some("build")).as_str(),
+            "script:package.json#build"
+        );
+        // the run mirrors its script, so one is derivable from the other
+        assert_eq!(
+            NodeId::run("package.json", Some("build")).path_part(),
+            NodeId::script("package.json", Some("build")).path_part()
+        );
+    }
+
+    #[test]
+    fn a_machine_local_schedule_can_never_collide_with_a_declared_one() {
+        // `~/` is a segment `canonical_rel` never produces, so no file in the
+        // workspace can be named such that its schedule collides with these.
+        let declared = NodeId::schedule("Data Sources/Refresh Cadences.md", "pubmed_updates");
+        assert_eq!(
+            declared.as_str(),
+            "schedule:Data Sources/Refresh Cadences.md#pubmed-updates"
+        );
+        assert!(!declared.as_str().contains("~/"));
+        assert_eq!(
+            NodeId::installed_schedule("dev.aneural.acme.download-pubmed").as_str(),
+            "schedule:~/installed/dev.aneural.acme.download-pubmed"
+        );
+        assert_eq!(
+            NodeId::managed_schedule("scripts/download_pubmed.py").as_str(),
+            "schedule:~/managed/scripts/download_pubmed.py"
+        );
+        // two rows of one table are two schedules, not one overwriting the other
+        assert_ne!(NodeId::schedule("x.md", "a"), NodeId::schedule("x.md", "b"));
     }
 }

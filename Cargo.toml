@@ -18,6 +18,7 @@ aneural-lang = { path = "crates/aneural-lang" }
 aneural-engine = { path = "crates/aneural-engine" }
 aneural-icons = { path = "crates/aneural-icons" }
 aneural-registry = { path = "crates/aneural-registry" }
+aneural-git = { path = "crates/aneural-git" }
 
 # general
 serde = { version = "1", features = ["derive"] }
@@ -34,6 +35,17 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 time = { version = "0.3", features = ["formatting", "parsing", "local-offset"] }
+
+# git history. `default-features = false` is load-bearing: gix's defaults pull in
+# `blocking-network-client` (and `extras`: blame, merge, notes, credentials), and
+# only aneural-registry may reach the network. `max-performance-safe` is the
+# pure-Rust fast path — `max-performance` is zlib-ng and needs cc/cmake.
+gix = { version = "0.87", default-features = false, features = [
+  "max-performance-safe",
+  "sha1",
+  "revision",
+  "blob-diff",
+] }
 
 # storage / fs
 rusqlite = { version = "0.40.2", features = ["bundled"] }

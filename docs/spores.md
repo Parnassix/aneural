@@ -18,11 +18,27 @@ nodes from files. Harvested nodes are always derived — Aneural never writes th
 ## Harvester kinds
 
 - **`regex`** — `include`/`exclude` globs, a Rust `pattern` applied per line with named captures.
+  `once: true` stops at the first matching line, for a pattern that marks what a file *is* — a
+  shebang, a module constant — rather than a thing to collect one of per occurrence.
 - **`tree-sitter`** — `language` + `query` (tree-sitter S-expression); each match's captures become
   template variables.
-- **`markdown`** — `granularity: document | heading`; optional `wikilinks` (`[[Name]]` → edges, resolved
-  by file stem, preferring the same directory) and `annotate` (a frontmatter list of paths → edges).
+- **`markdown`** — `granularity: document | heading | table-row`; optional `wikilinks` (`[[Name]]` → edges,
+  resolved by name — file stem or an `aliases:` the target declares — preferring the same directory)
+  and `annotate` (a frontmatter list of paths → edges).
   Variables: `{file} {title} {heading} {line} {body} {fm.<key>}`.
+  `wikilinks.unresolved` takes a node to emit for a link whose target does not exist, with
+  `{target}` and `{slug}`; `tags` takes a `frontmatterKey` (default `tags`) and a `node` with
+  `{tag}` and `{slug}`. Both emit **shared** nodes — one per name, belonging to no file, so they
+  carry no origin and are collected once nothing points at them.
+  `granularity: table-row` emits one node per row of a pipe table, with `{col.<key>}` per column
+  plus `{table}` (the nearest heading above it), `{headers}`, `{row}` and `{line}`; `table.requires`
+  names columns a table must have, which is how a harvester picks the one it means in a document
+  holding several. **Column keys are the header slugged with `_`** — `last_refreshed`, not
+  `last-refreshed` — because a template variable matches `[A-Za-z_][A-Za-z0-9_.]*`, so a hyphen
+  would render as the empty string and say nothing about why. A cell that is a single backtick span
+  is unquoted (`` `aact` `` → `aact`), cells are capped at 2000 characters, and a pipe is not a
+  separator when it is escaped, inside a backtick span, or inside `[[a|b]]`. Rows may be ragged: a
+  row is read for the columns it does have.
 - **`sqlite`** — a local database's schema; the one kind given a *path* instead of bytes.
 - **`http`** — a JSON web API; the one kind with no file behind it at all. Requires an `http`
   capability, so it is tier 1 and consent-gated. See below.

@@ -44,6 +44,7 @@ icon_table! {
         // spores / annotations
         LuMessageSquare, LuMap, LuLightbulb, LuStickyNote, LuBookOpen, LuBug,
         LuWrench, LuFlame, LuScale, LuTag, LuShield, LuHash, LuLink, LuImage,
+        LuGauge, LuCalendarClock, LuHistory,
         // brand / ui
         LuLeaf, LuSprout, LuPuzzle, LuCircleDot, LuSearch, LuSettings, LuPin,
         LuEye, LuEyeOff, LuTerminal, LuCheck, LuX, LuFunnel, LuListFilter,
@@ -112,6 +113,11 @@ mod tests {
             "LuStickyNote",
             "LuPuzzle",
             "LuSprout",
+            "VsSourceControl",
+            "LuGauge",
+            "LuTerminal",
+            "LuCalendarClock",
+            "LuHistory",
         ] {
             assert!(
                 is_valid(name),

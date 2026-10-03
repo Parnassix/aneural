@@ -105,6 +105,26 @@
           "type": "object"
         },
         {
+          "description": "Read files at these paths, which may be outside the workspace.\n\n`native`, and deliberately so. There is no path analogue of\n[`is_private_host`] — `paths: [\"~\"]` looks like any other entry — and\n`FsRead` composed with `Http` is arbitrary exfiltration of anything\nreadable. So this is vocabulary, not a grant: a spore that wants to read\nyour home directory can now say so and be refused for the right reason.\nThe engine's own producers read files without declaring anything,\nbecause the engine is the trusted part, not a thing the registry ships.",
+          "properties": {
+            "kind": {
+              "const": "fs-read",
+              "type": "string"
+            },
+            "paths": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "paths"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Write to these workspace-relative paths.",
           "properties": {
             "kind": {
@@ -304,6 +324,10 @@
               "const": "regex",
               "type": "string"
             },
+            "once": {
+              "description": "Stop at the first matching line. For a harvester whose pattern is a\nmarker that a file *is* something — a shebang, a module constant —\nrather than a thing to collect one of per occurrence. Without it the\nnode is emitted once per match and survives only because ids dedupe,\nwhich quietly makes the result depend on harvester order.",
+              "type": "boolean"
+            },
             "pattern": {
               "description": "Rust regex with named captures. Applied per line.",
               "type": "string"
@@ -410,6 +434,28 @@
               "const": "markdown",
               "type": "string"
             },
+            "table": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TableSelect"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Which table to read, for `granularity: table-row`. A document holds\nseveral tables about several things, so a harvester says which one it\nmeans by naming columns it must have."
+            },
+            "tags": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Tags"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Turn a frontmatter tag list into shared nodes."
+            },
             "wikilinks": {
               "anyOf": [
                 {
@@ -467,7 +513,7 @@
               ],
               "description": "Emit edges from a table to the tables its foreign keys point at."
             },
-            "sample_rows": {
+            "sampleRows": {
               "description": "Rows to sample into a `sample` prop. Zero — the default — reads no\ndata at all. Anything above zero puts real rows into the graph, which\nthe MCP server then serves to a coding agent, so it is opt-in and\ncapped rather than unbounded.",
               "format": "uint32",
               "minimum": 0,
@@ -506,14 +552,14 @@
               "const": "http",
               "type": "string"
             },
-            "max_pages": {
+            "maxPages": {
               "default": 1,
               "description": "Follow `Link: rel=\"next\"` at most this many times. One page only by\ndefault: a spore has to ask before it walks an entire API.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
-            "refresh_seconds": {
+            "refreshSeconds": {
               "default": 300,
               "description": "How often to re-fetch. The floor is [`MIN_REFRESH_SECONDS`].",
               "format": "uint64",
@@ -588,6 +634,11 @@
         {
           "const": "heading",
           "description": "One node per `## heading` (level 2 by default).",
+          "type": "string"
+        },
+        {
+          "const": "table-row",
+          "description": "One node per row of a pipe table. Vars: `{col.<key>}` per column, plus\n`{table}` (the headers, joined), `{headers}`, `{row}` (1-based within the\ntable) and `{line}`.\n\nColumn keys are the header text slugged with `_` rather than `-`, so\n`last_refreshed`, not `last-refreshed`. That is forced, not chosen: a\ntemplate var is matched by `[A-Za-z_][A-Za-z0-9_.]*`, which admits `.`\nbut not `-`, so a hyphenated key would render as the empty string and\nsay nothing about why.",
           "type": "string"
         }
       ]
@@ -686,11 +737,57 @@
       },
       "type": "object"
     },
+    "TableSelect": {
+      "description": "Which table a `table-row` harvester means.",
+      "properties": {
+        "requires": {
+          "default": [],
+          "description": "Only tables whose header row carries every one of these column keys.\nEmpty means every table in the file, which is rarely what anyone wants.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Tags": {
+      "properties": {
+        "edgeKind": {
+          "default": "RELATES_TO",
+          "type": "string"
+        },
+        "frontmatterKey": {
+          "default": "tags",
+          "description": "Frontmatter key holding the tags. Written `[a, b]`, as a `- item` block\nor bare `a, b` — all three are read.",
+          "type": "string"
+        },
+        "node": {
+          "$ref": "#/$defs/EmitNode",
+          "description": "The node one tag becomes. Shared by every file carrying that tag, so it\nis emitted with no origin of its own and collected once nothing carries\nit any more — the same arrangement as a `Package`. Vars: `{tag}` as\nwritten, and `{slug}` for the id, which makes tags case-insensitive."
+        }
+      },
+      "required": [
+        "node"
+      ],
+      "type": "object"
+    },
     "WikiLinks": {
       "properties": {
         "edgeKind": {
           "default": "RELATES_TO",
           "type": "string"
+        },
+        "unresolved": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmitNode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Placeholder node for a link whose target does not exist.\n\nA wiki link is a claim that a note *should* exist, and in a real vault a\ngood fraction of them point at notes nobody has written yet — Obsidian\nkeeps those in its graph rather than discarding them. Without this the\nlink is dropped and the asking is lost with it.\n\nThe node is shared by every file that links to the same missing target,\nso it is emitted with no origin of its own (the same arrangement as a\n`Package`) and collected once nothing points at it any more. Vars:\n`{target}` as written, and `{slug}` for the id."
         }
       },
       "type": "object"

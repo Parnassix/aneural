@@ -74,6 +74,13 @@ impl Node {
     pub fn prop_str(&self, key: &str) -> Option<&str> {
         self.props.get(key).and_then(Value::as_str)
     }
+
+    /// A counting prop. Every tally Aneural writes is an `i64`, so this is
+    /// the accessor for them; a prop that is not a whole number reads as
+    /// `None` rather than being rounded into one.
+    pub fn prop_i64(&self, key: &str) -> Option<i64> {
+        self.props.get(key).and_then(Value::as_i64)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

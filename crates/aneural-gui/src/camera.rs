@@ -12,6 +12,7 @@ use crate::layout::LayoutParams;
 use crate::picking::{DragState, Hovered};
 use aneural_engine::EngineCommand;
 use bevy::camera::visibility::RenderLayers;
+use bevy::ecs::entity::EntityHashSet;
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -19,7 +20,10 @@ use bevy_egui::{EguiContexts, PrimaryEguiContext};
 use bevy_pancam::{PanCam, PanCamPlugin, PanCamSystems};
 
 const MIN_SCALE: f32 = 0.15;
-const MAX_SCALE: f32 = 12.0;
+/// Far enough out to hold a whole monorepo. The old ceiling of 12 was below
+/// what a few thousand nodes need, so framing could not actually frame them
+/// and the graph could only ever be looked at from inside.
+const MAX_SCALE: f32 = 60.0;
 /// Pixels the cursor must travel before a background press counts as a pan.
 const PAN_DEADZONE: f32 = 4.0;
 
@@ -51,17 +55,44 @@ pub struct UiCapture {
     pub keyboard: bool,
 }
 
-/// One-shot "frame everything now".
+/// One-shot "frame this now".
 #[derive(Resource, Default)]
-pub struct FrameRequest(pub bool);
+pub struct FrameRequest {
+    pub now: bool,
+    /// Frame only these. Empty is everything visible, which is what `F` and
+    /// the frame button ask for; a plan step asks for its own files instead.
+    pub only: EntityHashSet,
+}
+
+impl FrameRequest {
+    /// Frame everything visible.
+    pub fn all(&mut self) {
+        self.now = true;
+        self.only.clear();
+    }
+
+    pub fn these(&mut self, only: EntityHashSet) {
+        self.now = true;
+        self.only = only;
+    }
+}
 
 /// Smoothly keep the whole graph in view while it grows.
 #[derive(Resource)]
-pub struct AutoFollow(pub bool);
+pub struct AutoFollow {
+    /// Whether the camera is still keeping the whole graph in view.
+    pub on: bool,
+    /// Set once the user pans or zooms: from then on the view is theirs and
+    /// framing never takes it back on its own.
+    pub released: bool,
+}
 
 impl Default for AutoFollow {
     fn default() -> Self {
-        AutoFollow(true)
+        AutoFollow {
+            on: true,
+            released: false,
+        }
     }
 }
 
@@ -225,7 +256,10 @@ fn gate_pancam(
         (mouse.pressed(MouseButton::Right) || mouse.pressed(MouseButton::Middle)) && on_canvas;
     let scrolled = wheel.read().next().is_some() && on_canvas;
     if (grab.active && grab.moved) || side_pan || scrolled {
-        follow.0 = false;
+        *follow = AutoFollow {
+            on: false,
+            released: true,
+        };
     }
 
     // Left button: only pan for a grab that began on empty canvas. Other
@@ -253,7 +287,7 @@ fn hotkeys(
         return;
     }
     if keys.just_pressed(KeyCode::KeyF) {
-        frame.0 = true;
+        frame.all();
     }
     if keys.just_pressed(KeyCode::Space) {
         layout.stir();
@@ -273,30 +307,53 @@ fn hotkeys(
         KeyCode::KeyS,
         KeyCode::KeyD,
     ]) {
-        follow.0 = false;
+        *follow = AutoFollow {
+            on: false,
+            released: true,
+        };
     }
 }
 
-/// Camera translation and orthographic scale that fit every visible node
-/// inside the canvas (the window minus egui panels).
-fn fit(
-    nodes: &Query<&Pos, (With<GraphNode>, Without<Hidden>)>,
-    windows: &Query<&Window, With<PrimaryWindow>>,
-    canvas: &CanvasRect,
-) -> Option<(Vec2, f32)> {
+/// The centre these positions sit around, and the orthographic scale that
+/// fits them into a target `size` screen points across.
+///
+/// No panel arithmetic: the caller owns the whole target. That is what lets a
+/// portal — which renders to a texture of its own and has no panels to avoid —
+/// frame a handful of nodes with the same code that frames the workspace.
+pub fn fit_into(positions: impl Iterator<Item = Vec2>, size: Vec2) -> Option<(Vec2, f32)> {
     let mut min = Vec2::splat(f32::MAX);
     let mut max = Vec2::splat(f32::MIN);
     let mut count = 0;
-    for p in nodes {
-        min = min.min(p.0);
-        max = max.max(p.0);
+    for p in positions {
+        min = min.min(p);
+        max = max.max(p);
         count += 1;
     }
     if count == 0 {
         return None;
     }
-    let size = (max - min).max(Vec2::splat(100.0)) + Vec2::splat(160.0);
-    let center = (min + max) / 2.0;
+    // A little air, and a floor so that one node alone does not fill the frame.
+    let world = (max - min).max(Vec2::splat(100.0)) + Vec2::splat(160.0);
+    let size = size.max(Vec2::splat(120.0));
+    let scale = (world.x / size.x)
+        .max(world.y / size.y)
+        .clamp(MIN_SCALE, MAX_SCALE);
+    Some(((min + max) / 2.0, scale))
+}
+
+/// Camera translation and orthographic scale that fit every visible node
+/// inside the canvas (the window minus egui panels).
+fn fit(
+    positions: impl Iterator<Item = Vec2>,
+    windows: &Query<&Window, With<PrimaryWindow>>,
+    canvas: &CanvasRect,
+) -> Option<(Vec2, f32)> {
+    // Room for the names. A node's label is drawn beneath it and reaches well
+    // past it, so fitting the node positions alone puts the outermost label
+    // half under a drawer. The margin is in screen points because that is what
+    // a label's width is measured in — world padding shrinks as the camera
+    // pulls back, exactly when the labels do not.
+    const MARGIN: f32 = 80.0;
     let win = windows
         .single()
         .ok()
@@ -307,28 +364,37 @@ fn fit(
     } else {
         (win, win / 2.0)
     };
-    let scale = (size.x / canvas_size.x)
-        .max(size.y / canvas_size.y)
-        .clamp(MIN_SCALE, MAX_SCALE);
+    let canvas_size = canvas_size - Vec2::splat(2.0 * MARGIN);
+    let (center, scale) = fit_into(positions, canvas_size)?;
     // the camera looks at the window centre; shift it so the graph centre
     // lands on the canvas centre instead (screen y is down, world y is up)
     let offset = canvas_center - win / 2.0;
-    let translation = center - Vec2::new(offset.x, -offset.y) * scale;
-    Some((translation, scale))
+    Some((center - Vec2::new(offset.x, -offset.y) * scale, scale))
 }
 
 fn frame_all(
     mut frame: ResMut<FrameRequest>,
-    nodes: Query<&Pos, (With<GraphNode>, Without<Hidden>)>,
+    nodes: Query<(Entity, &Pos, Has<Hidden>), With<GraphNode>>,
     mut cam: Query<(&mut Transform, &mut Projection), With<MainCamera>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     canvas: Res<CanvasRect>,
 ) {
-    if !frame.0 {
+    if !frame.now {
         return;
     }
-    frame.0 = false;
-    let Some((center, scale)) = fit(&nodes, &windows, &canvas) else {
+    frame.now = false;
+    let wanted = std::mem::take(&mut frame.only);
+    // Asked-for nodes are framed whether or not a filter is hiding them this
+    // frame: the ask came from the reader, and the filters catch up a frame
+    // later. Framing everything still means everything *visible*.
+    let seen = nodes
+        .iter()
+        .filter(|(e, _, hidden)| match wanted.is_empty() {
+            true => !hidden,
+            false => wanted.contains(e),
+        })
+        .map(|(_, p, _)| p.0);
+    let Some((center, scale)) = fit(seen, &windows, &canvas) else {
         return;
     };
     let Ok((mut t, mut proj)) = cam.single_mut() else {
@@ -353,17 +419,39 @@ fn follow_graph(
     mut cam: Query<(&mut Transform, &mut Projection), With<MainCamera>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     canvas: Res<CanvasRect>,
+    mut steady: Local<f32>,
+    mut generation: Local<u64>,
 ) {
-    if !follow.0 {
+    // A workspace of thousands takes a while to arrive and grows by a long
+    // way as it does, so every new batch puts the camera back on the graph.
+    // Only while it is first growing, though: once the index is in, changes
+    // come a file at a time, and re-framing on each one would carry the view
+    // off whatever was being looked at. Nor at all if the user has taken the
+    // view over themselves.
+    if status.generation != *generation {
+        *generation = status.generation;
+        *steady = 0.0;
+        if !follow.released && !status.complete {
+            follow.on = true;
+        }
+    }
+    if !follow.on {
         return;
     }
-    let Some((center, scale)) = fit(&nodes, &windows, &canvas) else {
+    let Some((center, scale)) = fit(nodes.iter().map(|p| p.0), &windows, &canvas) else {
         return;
     };
     let Ok((mut t, mut proj)) = cam.single_mut() else {
         return;
     };
-    let settled = status.complete && layout.frozen;
+    // Still for a moment is not settled: the layout falls quiet between
+    // batches while the rest of the workspace is still being indexed.
+    if status.complete && layout.frozen {
+        *steady += time.delta_secs();
+    } else {
+        *steady = 0.0;
+    }
+    let settled = *steady > 0.75;
     // exponential ease; snap on the final frame
     let k = if settled {
         1.0
@@ -378,6 +466,6 @@ fn follow_graph(
         o.scale += (scale - o.scale) * k;
     }
     if settled {
-        follow.0 = false;
+        follow.on = false;
     }
 }

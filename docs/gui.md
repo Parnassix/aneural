@@ -19,6 +19,33 @@ cargo run -p aneural-gui --features dev -- <directory>     # omit the path to ge
   wander a couple of pixels off their layout positions (`Drift`, never fed back into the forces or
   picking), pulses of light travel the hyphae, and spore motes drift across the canvas. `gui.circadian`
   (`auto` | `day` | `night`) pins it, and the dial in the top bar cycles the same three for the session.
+- **Live** (`live/`): what is happening on this machine right now, as a glow on the nodes involved and
+  a **portal** onto them — a small aperture with a camera of its own rendering that corner of the
+  graph into a texture, so it carries the real icons, hyphae and night palette rather than a drawing
+  of them. The camera never moves on its own; clicking a portal is how you go there. Signals come from
+  two places and nothing is stored: the **live delta stream** the app already drains (a new `Plan`, a
+  `Session` whose props moved, a new `Commit`, a `Run` changing status, a batch of files changing at
+  once), and a **probe** on its own thread for the three things no file says — which Claude sessions
+  are alive (`~/.claude/sessions/<pid>.json`, whose entries go stale, so the pid is checked against the
+  process table), which processes are running one of this workspace's `Script`s (matched on argv), what
+  **work a live session has in flight** whether or not the graph names it, and whether a repository is
+  mid-merge. A signal that names no node on the canvas is never raised, which is both the design rule
+  and the privacy answer.
+
+  A **task** is the second of those: an agent runs things out of a scratchpad under `/private/tmp`
+  that no indexer will ever walk, so the work Aneural most wants to report is work it cannot name in
+  advance. A process belongs to a session when the session's id appears where the *system* put it --
+  in a scratchpad path or a `claude --resume` argument, never merely somewhere in the command line --
+  and the chain that does the work is collapsed into one task, summed and named for the script at the
+  top of it rather than the interpreter at the bottom. Shells, `sleep`s and Aneural itself are not
+  work. The subject is the place the work is happening: the repository the chain names, else the
+  session, else the workspace root. The caption gives the program, the elapsed time, the pids and the
+  memory -- never the command line, which is where tokens live. One decaying number per signal drives the glow, the rim and the portal's
+  life. The probe's interval is adaptive — 700 ms when something is running in front of you, 5 s
+  normally, 30 s unfocused, and stretching all the way to 30 s as load approaches saturation, because
+  the work this is here to watch must not be slowed by the watching. `gui.live`, `gui.portals` (0 keeps
+  the glow and the top-bar count) and `gui.livePace` (`auto` | `eager` | `calm` | `off`) tune it;
+  `false` is the app as it was, pixel for pixel.
 - **Layout**: force-directed on `FixedUpdate` — repulsion, springs per edge kind, gravity toward the
   CONTAINS parent, damping, energy-based freeze. Drag pins a node.
 - **Panels** (egui): filters (kinds, edge kinds, repos, search, focus mode + depth), inspector (props,
@@ -35,4 +62,4 @@ cargo run -p aneural-gui --features dev -- <directory>     # omit the path to ge
   egui panels) while it first grows, and stops following on the first manual pan/zoom or once the
   index is complete and the layout has settled. Left-drag on empty canvas pans; left-drag on a node
   moves it; right/middle-drag pans anywhere; wheel/pinch zooms to the cursor.
-- Keys: `F` frame all · `Space` re-run layout · `R` reindex · arrows/WASD pan.
+- Keys: `F` frame all · `Space` lay the graph out afresh · `R` reindex · arrows/WASD pan.

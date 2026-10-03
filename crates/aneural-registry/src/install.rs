@@ -273,8 +273,6 @@ pub fn uninstall(root: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Toggle a spore in `config.spores.enabled`, migrating the block on the way
-/// through — a mutating action is exactly when persisting a migration is fair.
 /// Record a value for one of a spore's declared settings.
 ///
 /// Settings are not credentials. A `{secret.*}` never comes from here — it comes
@@ -300,6 +298,8 @@ pub fn set_setting(root: &Path, id: &str, key: &str, value: Option<&str>) -> Res
     Ok(config)
 }
 
+/// Toggle a spore in `config.spores.enabled`, migrating the block on the way
+/// through — a mutating action is exactly when persisting a migration is fair.
 pub fn set_enabled(root: &Path, id: &str, on: bool) -> Result<Config> {
     let ws = aneural_core::Workspace::at(root);
     let mut config = ws.load_config()?;

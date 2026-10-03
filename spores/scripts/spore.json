@@ -1,0 +1,193 @@
+{
+  "$schema": "https://aneural.dev/schema/spore-v2.json",
+  "publisher": "aneural",
+  "name": "scripts",
+  "version": "0.1.0",
+  "displayName": "Scripts",
+  "description": "Finds the things in a workspace you can run \u2014 files with a shebang, and files that live in a scripts/ or bin/ directory \u2014 and the schedules declared for them in crontabs and GitHub Actions workflows. Reads files only; it never runs anything.",
+  "license": "MIT",
+  "aneural": ">=0.1",
+  "keywords": [
+    "scripts",
+    "schedule",
+    "cron",
+    "automation"
+  ],
+  "categories": [
+    "automation"
+  ],
+  "nodeTypes": [
+    {
+      "kind": "Script",
+      "label": "Script",
+      "icon": "LuTerminal",
+      "color": "#c9736b",
+      "shape": "square",
+      "description": "Something in this workspace you can run"
+    },
+    {
+      "kind": "Schedule",
+      "label": "Schedule",
+      "icon": "LuCalendarClock",
+      "color": "#7d9ec0",
+      "shape": "pill",
+      "description": "When a script is declared to run"
+    }
+  ],
+  "harvesters": [
+    {
+      "id": "shebang",
+      "kind": "regex",
+      "include": [
+        "**/*.{sh,bash,zsh,fish,ps1,py,rb,pl,lua,r,R,js,mjs,cjs,ts}",
+        "**/scripts/**",
+        "**/bin/**"
+      ],
+      "exclude": [
+        "**/node_modules/**",
+        "**/.venv/**",
+        "**/target/**"
+      ],
+      "pattern": "^#!\\s*(?P<interpreter>\\S+)",
+      "once": true,
+      "emit": {
+        "node": {
+          "kind": "Script",
+          "id": "script:{file}",
+          "label": "{stem(file)}",
+          "props": {
+            "file": "{file}",
+            "interpreter": "{interpreter}",
+            "found": "shebang"
+          }
+        },
+        "edges": [
+          {
+            "kind": "REFERENCES",
+            "src": "$node",
+            "dst": "file:{file}",
+            "props": {
+              "via": "source"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "script-directory",
+      "kind": "regex",
+      "include": [
+        "**/scripts/*",
+        "**/bin/*",
+        "**/scripts/*/*"
+      ],
+      "exclude": [
+        "**/node_modules/**",
+        "**/.venv/**",
+        "**/target/**",
+        "**/*.{md,mdx,txt,json,toml,yaml,yml,lock,csv,tsv,cfg,ini,png,svg,jpg,ico}",
+        "**/__pycache__/**",
+        "**/__init__.py"
+      ],
+      "pattern": "^",
+      "once": true,
+      "emit": {
+        "node": {
+          "kind": "Script",
+          "id": "script:{file}",
+          "label": "{stem(file)}",
+          "props": {
+            "file": "{file}",
+            "found": "directory"
+          }
+        },
+        "edges": [
+          {
+            "kind": "REFERENCES",
+            "src": "$node",
+            "dst": "file:{file}",
+            "props": {
+              "via": "source"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "crontab",
+      "kind": "regex",
+      "include": [
+        "**/crontab",
+        "**/*.cron",
+        "**/crontabs/*",
+        "**/cron.d/*"
+      ],
+      "pattern": "^(?P<cron>[-0-9*/,]+\\s+[-0-9*/,]+\\s+[-0-9*/,]+\\s+[-0-9*/,]+\\s+[-0-9*/,]+)\\s+(?P<command>\\S.*?)\\s*$",
+      "emit": {
+        "node": {
+          "kind": "Schedule",
+          "id": "schedule:{file}#{hash(match)}",
+          "label": "{cron}",
+          "props": {
+            "cron": "{cron}",
+            "command": "{command}",
+            "declaredBy": "crontab",
+            "file": "{file}",
+            "line": "{line}"
+          }
+        },
+        "edges": [
+          {
+            "kind": "REFERENCES",
+            "src": "$node",
+            "dst": "file:{file}",
+            "props": {
+              "via": "declared"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "github-actions",
+      "kind": "regex",
+      "include": [
+        ".github/workflows/*.{yml,yaml}",
+        "**/.github/workflows/*.{yml,yaml}"
+      ],
+      "pattern": "^\\s*-?\\s*cron:\\s*['\"](?P<cron>[^'\"]+)['\"]",
+      "emit": {
+        "node": {
+          "kind": "Schedule",
+          "id": "schedule:{file}#{hash(cron)}",
+          "label": "{cron}",
+          "props": {
+            "cron": "{cron}",
+            "declaredBy": "github-actions",
+            "workflow": "{stem(file)}",
+            "file": "{file}",
+            "line": "{line}"
+          }
+        },
+        "edges": [
+          {
+            "kind": "REFERENCES",
+            "src": "$node",
+            "dst": "file:{file}",
+            "props": {
+              "via": "declared"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "panel": {
+    "title": "Scripts",
+    "columns": [
+      "file",
+      "interpreter",
+      "found"
+    ]
+  }
+}

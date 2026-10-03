@@ -11,6 +11,7 @@ repository.workspace = true
 aneural-core.workspace = true
 aneural-store.workspace = true
 aneural-lang.workspace = true
+aneural-git.workspace = true
 aneural-icons.workspace = true
 rusqlite.workspace = true
 ignore.workspace = true
@@ -30,3 +31,4 @@ time.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+aneural-git.workspace = true

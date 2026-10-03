@@ -123,6 +123,16 @@ pub enum Capability {
     },
     /// Read nodes of these kinds back out of the graph.
     GraphRead { kinds: Vec<String> },
+    /// Read files at these paths, which may be outside the workspace.
+    ///
+    /// `native`, and deliberately so. There is no path analogue of
+    /// [`is_private_host`] — `paths: ["~"]` looks like any other entry — and
+    /// `FsRead` composed with `Http` is arbitrary exfiltration of anything
+    /// readable. So this is vocabulary, not a grant: a spore that wants to read
+    /// your home directory can now say so and be refused for the right reason.
+    /// The engine's own producers read files without declaring anything,
+    /// because the engine is the trusted part, not a thing the registry ships.
+    FsRead { paths: Vec<String> },
     /// Write to these workspace-relative paths.
     FsWrite { paths: Vec<String> },
     /// Run these commands on the user's machine.
@@ -134,7 +144,9 @@ impl Capability {
         match self {
             Capability::Http { .. } | Capability::Secret { .. } => Tier::Http,
             Capability::Tcp { .. } | Capability::GraphRead { .. } => Tier::Sandboxed,
-            Capability::FsWrite { .. } | Capability::Subprocess { .. } => Tier::Native,
+            Capability::FsRead { .. }
+            | Capability::FsWrite { .. }
+            | Capability::Subprocess { .. } => Tier::Native,
         }
     }
 
@@ -152,6 +164,7 @@ impl Capability {
             Capability::GraphRead { kinds } => {
                 format!("read {} nodes from your graph", join(kinds))
             }
+            Capability::FsRead { paths } => format!("read files under {}", join(paths)),
             Capability::FsWrite { paths } => format!("write files under {}", join(paths)),
             Capability::Subprocess { commands } => {
                 format!("run {} on your machine", join(commands))
@@ -165,6 +178,7 @@ impl Capability {
             Capability::Tcp { endpoints } => endpoints,
             Capability::Secret { names, .. } => names,
             Capability::GraphRead { kinds } => kinds,
+            Capability::FsRead { paths } => paths,
             Capability::FsWrite { paths } => paths,
             Capability::Subprocess { commands } => commands,
         }
@@ -539,8 +553,16 @@ impl SporeManifest {
         let mut errs = Vec::new();
         if let Some(prefix) = template_prefix(&emit.node.id) {
             if !self.may_use_prefix(prefix) {
+                // Two different refusals, and saying "reserved" for both sends
+                // the reader to `RESERVED_ID_PREFIXES` to look for a prefix that
+                // was never in it. Emitting a builtin *kind* is fine — only the
+                // id namespace is owned — so the message has to say which.
+                let why = match RESERVED_ID_PREFIXES.contains(&prefix) {
+                    true => format!("`{prefix}:` is reserved for the engine"),
+                    false => format!("`{prefix}:` belongs to another producer"),
+                };
                 errs.push(format!(
-                    "harvester `{hid}`: node id prefix `{prefix}:` is reserved; ids must start with `{}.`",
+                    "harvester `{hid}`: node id prefix {why}; ids must start with `{}.`                      (the node's `kind` may still be a builtin one)",
                     self.id()
                 ));
             }
@@ -595,7 +617,14 @@ impl EdgeTypeDef {
 /// and the functions `{hash(text)}` and `{slug(text)}`. `$node` inside an
 /// edge refers to the node emitted by the same harvester.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+// `rename_all` on an enum renames the *variants*; without `rename_all_fields`
+// the struct-variant fields keep their Rust spelling, so `maxPages` and
+// `refreshSeconds` in a manifest were silently dropped and the defaults used.
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum Harvester {
     /// Line-oriented regex over files matching `include` globs.
     Regex {
@@ -606,6 +635,13 @@ pub enum Harvester {
         exclude: Vec<String>,
         /// Rust regex with named captures. Applied per line.
         pattern: String,
+        /// Stop at the first matching line. For a harvester whose pattern is a
+        /// marker that a file *is* something — a shebang, a module constant —
+        /// rather than a thing to collect one of per occurrence. Without it the
+        /// node is emitted once per match and survives only because ids dedupe,
+        /// which quietly makes the result depend on harvester order.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        once: bool,
         emit: Emit,
     },
     /// tree-sitter query over a supported language; captures become template vars.
@@ -638,6 +674,14 @@ pub enum Harvester {
         /// Emit edges from a frontmatter list of paths.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         annotate: Option<Annotate>,
+        /// Turn a frontmatter tag list into shared nodes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<Tags>,
+        /// Which table to read, for `granularity: table-row`. A document holds
+        /// several tables about several things, so a harvester says which one it
+        /// means by naming columns it must have.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table: Option<TableSelect>,
     },
     /// Schema of a local SQLite database. Unlike every other kind this one is
     /// given the file's *path* rather than its bytes, so it can open a database
@@ -847,6 +891,26 @@ pub enum MarkdownGranularity {
     Document,
     /// One node per `## heading` (level 2 by default).
     Heading,
+    /// One node per row of a pipe table. Vars: `{col.<key>}` per column, plus
+    /// `{table}` (the headers, joined), `{headers}`, `{row}` (1-based within the
+    /// table) and `{line}`.
+    ///
+    /// Column keys are the header text slugged with `_` rather than `-`, so
+    /// `last_refreshed`, not `last-refreshed`. That is forced, not chosen: a
+    /// template var is matched by `[A-Za-z_][A-Za-z0-9_.]*`, which admits `.`
+    /// but not `-`, so a hyphenated key would render as the empty string and
+    /// say nothing about why.
+    TableRow,
+}
+
+/// Which table a `table-row` harvester means.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TableSelect {
+    /// Only tables whose header row carries every one of these column keys.
+    /// Empty means every table in the file, which is rarely what anyone wants.
+    #[serde(default)]
+    pub requires: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -854,9 +918,47 @@ pub enum MarkdownGranularity {
 pub struct WikiLinks {
     #[serde(default = "WikiLinks::default_kind")]
     pub edge_kind: String,
+    /// Placeholder node for a link whose target does not exist.
+    ///
+    /// A wiki link is a claim that a note *should* exist, and in a real vault a
+    /// good fraction of them point at notes nobody has written yet — Obsidian
+    /// keeps those in its graph rather than discarding them. Without this the
+    /// link is dropped and the asking is lost with it.
+    ///
+    /// The node is shared by every file that links to the same missing target,
+    /// so it is emitted with no origin of its own (the same arrangement as a
+    /// `Package`) and collected once nothing points at it any more. Vars:
+    /// `{target}` as written, and `{slug}` for the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved: Option<EmitNode>,
 }
 
 impl WikiLinks {
+    fn default_kind() -> String {
+        crate::kinds::EdgeKind::RELATES_TO.into()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Tags {
+    /// Frontmatter key holding the tags. Written `[a, b]`, as a `- item` block
+    /// or bare `a, b` — all three are read.
+    #[serde(default = "Tags::default_key")]
+    pub frontmatter_key: String,
+    #[serde(default = "Tags::default_kind")]
+    pub edge_kind: String,
+    /// The node one tag becomes. Shared by every file carrying that tag, so it
+    /// is emitted with no origin of its own and collected once nothing carries
+    /// it any more — the same arrangement as a `Package`. Vars: `{tag}` as
+    /// written, and `{slug}` for the id, which makes tags case-insensitive.
+    pub node: EmitNode,
+}
+
+impl Tags {
+    fn default_key() -> String {
+        "tags".into()
+    }
     fn default_kind() -> String {
         crate::kinds::EdgeKind::RELATES_TO.into()
     }

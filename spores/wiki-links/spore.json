@@ -2,9 +2,9 @@
   "$schema": "https://aneural.dev/schema/spore-v2.json",
   "publisher": "aneural",
   "name": "wiki-links",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "displayName": "Notes & Wiki-links",
-  "description": "Obsidian-style knowledge without the vault: `.aneural/notes/*.md` become Note nodes, and every `[[Wiki Link]]` in any markdown file becomes a RELATES_TO edge between files.",
+  "description": "Obsidian-style knowledge, vault or no vault: `.aneural/notes/*.md` become Note nodes, every `[[Wiki Link]]` becomes a RELATES_TO edge, frontmatter `tags:` become shared Tag nodes, links written to a note's `aliases:` resolve, and a link to a note nobody has written yet is kept as a Missing Note rather than dropped.",
   "license": "MIT",
   "aneural": ">=0.1",
   "nodeTypes": [
@@ -15,6 +15,22 @@
       "color": "#86c5c0",
       "shape": "square",
       "description": "A note kept in .aneural/notes"
+    },
+    {
+      "kind": "Tag",
+      "label": "Tag",
+      "icon": "LuTag",
+      "color": "#c9a227",
+      "shape": "pill",
+      "description": "A frontmatter tag, shared by every file carrying it"
+    },
+    {
+      "kind": "MissingNote",
+      "label": "Missing note",
+      "icon": "LuLink",
+      "color": "#7a7f87",
+      "shape": "diamond",
+      "description": "A note something links to that nobody has written yet"
     }
   ],
   "edgeTypes": [
@@ -53,7 +69,27 @@
         ]
       },
       "wikilinks": {
-        "edgeKind": "RELATES_TO"
+        "edgeKind": "RELATES_TO",
+        "unresolved": {
+          "kind": "MissingNote",
+          "id": "missing:{slug}",
+          "label": "{target}",
+          "props": {
+            "target": "{target}"
+          }
+        }
+      },
+      "tags": {
+        "frontmatterKey": "tags",
+        "edgeKind": "RELATES_TO",
+        "node": {
+          "kind": "Tag",
+          "id": "tag:{slug}",
+          "label": "{tag}",
+          "props": {
+            "tag": "{tag}"
+          }
+        }
       }
     },
     {
@@ -68,7 +104,27 @@
       ],
       "granularity": "document",
       "wikilinks": {
-        "edgeKind": "RELATES_TO"
+        "edgeKind": "RELATES_TO",
+        "unresolved": {
+          "kind": "MissingNote",
+          "id": "missing:{slug}",
+          "label": "{target}",
+          "props": {
+            "target": "{target}"
+          }
+        }
+      },
+      "tags": {
+        "frontmatterKey": "tags",
+        "edgeKind": "RELATES_TO",
+        "node": {
+          "kind": "Tag",
+          "id": "tag:{slug}",
+          "label": "{tag}",
+          "props": {
+            "tag": "{tag}"
+          }
+        }
       }
     }
   ]

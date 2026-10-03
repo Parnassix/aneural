@@ -9,9 +9,12 @@ mod filters;
 mod focus;
 mod graph;
 mod layout;
+mod live;
+mod markdown;
 mod marketplace;
 mod picking;
 mod render;
+mod review;
 mod switch;
 mod theme;
 mod ui;
@@ -73,6 +76,7 @@ fn main() {
             camera::CameraPlugin,
             picking::PickingPlugin,
             filters::FiltersPlugin,
+            live::LivePlugin,
             ui::UiPlugin,
             focus::FocusPlugin,
             switch::SwitchPlugin,

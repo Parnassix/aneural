@@ -94,6 +94,12 @@ fn drain_events(
     mut nodes: Query<(&mut crate::graph::GraphNode, &crate::graph::Pos)>,
     time: Res<Time>,
 ) {
+    // Last frame's news, read in `Update` and stale by now. Cleared here
+    // rather than by the reader so that turning the reader off cannot leave a
+    // list growing for the life of the session.
+    if !graph.stirred.is_empty() {
+        graph.stirred.clear();
+    }
     let Some(rx) = rx else { return };
     let now = time.elapsed_secs_f64();
     while let Ok(ev) = rx.0.try_recv() {

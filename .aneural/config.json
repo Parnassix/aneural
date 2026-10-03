@@ -39,10 +39,16 @@
   },
   "spores": {
     "enabled": [
-      "comments",
-      "plans",
-      "icebox",
-      "wiki-links"
+      "aneural.comments",
+      "aneural.plans",
+      "aneural.icebox",
+      "aneural.wiki-links"
+    ],
+    "registries": [
+      {
+        "name": "official",
+        "url": "https://raw.githubusercontent.com/Parnassix/aneural/main/registry/index.json"
+      }
     ]
   },
   "nodeTypes": {},
@@ -51,5 +57,11 @@
     "labelZoomThreshold": 0.8,
     "growthBudgetPerFrame": 200,
     "circadian": "auto"
+  },
+  "history": {
+    "git": true,
+    "maxCommits": 2000,
+    "claude": true,
+    "claudePrompts": false
   }
 }

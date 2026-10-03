@@ -112,8 +112,49 @@ pub struct FiltersPlugin;
 impl Plugin for FiltersPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Filters>()
-            .add_systems(Update, apply_filters);
+            .add_systems(Update, (seed_vault_defaults, apply_filters).chain());
     }
+}
+
+/// Honour an Obsidian vault's own "hide unresolved links" setting, once.
+///
+/// `.obsidian/` holds no knowledge, but it does hold this one preference the
+/// user already expressed, and a vault that keeps unresolved links out of its
+/// own graph view should not have them forced into this one. After that it is
+/// an ordinary kind row in the Filters drawer, so turning it back on is one
+/// click and this never fires again.
+fn seed_vault_defaults(
+    mut filters: ResMut<Filters>,
+    status: Res<IndexStatus>,
+    nodes: Query<&GraphNode>,
+    mut seeded: Local<bool>,
+    mut last: Local<u64>,
+) {
+    if *seeded || status.generation == *last {
+        return;
+    }
+    *last = status.generation;
+    let hides = nodes
+        .iter()
+        .any(|n| n.props.get("hideUnresolvedLinks").and_then(|v| v.as_bool()) == Some(true));
+    if !hides {
+        return;
+    }
+    // The placeholder kind is named by whichever spore emitted it, so it is
+    // recognised by the engine's stamp rather than by name.
+    let kinds: Vec<String> = nodes
+        .iter()
+        .filter(|n| n.props.get("unresolved").and_then(|v| v.as_bool()) == Some(true))
+        .map(|n| n.kind.clone())
+        .collect();
+    if kinds.is_empty() {
+        return;
+    }
+    for k in kinds {
+        filters.hidden_kinds.insert(k);
+    }
+    filters.dirty = true;
+    *seeded = true;
 }
 
 fn apply_filters(
@@ -122,6 +163,7 @@ fn apply_filters(
     selection: Res<Selection>,
     status: Res<IndexStatus>,
     graph: Res<GraphState>,
+    review: Res<crate::review::Review>,
     nodes: Query<(Entity, &GraphNode, Has<Hidden>)>,
 ) {
     let graph_changed = status.generation != filters.last_generation;
@@ -147,6 +189,19 @@ fn apply_filters(
     } else {
         None
     };
+    // Reading a plan, narrowed to it: the files it named, the files its work
+    // touched, and the sessions and commits in between. Everything else steps
+    // out of the way, which is the difference between reading a plan and
+    // hunting for it.
+    let plan_set: Option<HashSet<NodeId>> = match (review.only, &review.plan) {
+        (true, Some(plan)) => {
+            let reading = crate::review::read(&graph, plan);
+            let _ = plan;
+            Some(review.lit(&reading).into_iter().collect())
+        }
+        _ => None,
+    };
+    let step_set = review.step_files();
     for (e, gn, was_hidden) in &nodes {
         let mut visible = filters.kind_visible(&gn.kind);
         if visible && !filters.repos.is_empty() {
@@ -164,7 +219,16 @@ fn apply_filters(
                     .as_deref()
                     .is_some_and(|p| p.to_lowercase().contains(&q));
         }
+        if visible && let Some(set) = &plan_set {
+            visible = set.contains(&gn.id);
+        }
         if visible && let Some(set) = &focus_set {
+            visible = set.contains(&gn.id);
+        }
+        // The step being walked wins over every filter. Its files are what the
+        // reader was just sent to look at, and a search left in the box is no
+        // reason to send them to an empty patch of canvas.
+        if !visible && let Some(set) = &step_set {
             visible = set.contains(&gn.id);
         }
         if visible && was_hidden {

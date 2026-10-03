@@ -129,6 +129,13 @@ pub enum RegistryCommand {
         key: String,
         value: String,
     },
+    /// Turn a spore on or off *durably*. The engine converges the graph by
+    /// itself, but only this writes `config.spores.enabled`, so a toggle that
+    /// skipped the worker looked like it worked and was lost on restart.
+    SetEnabled {
+        id: String,
+        on: bool,
+    },
     Stop,
 }
 
@@ -139,6 +146,7 @@ pub enum RegistryEvent {
     Installed { id: String, version: String },
     Uninstalled(String),
     SettingSaved { id: String, key: String },
+    EnabledSaved { id: String, on: bool },
     Failed { op: &'static str, message: String },
 }
 
@@ -215,6 +223,19 @@ fn serve(root: &Path, tx: Sender<RegistryEvent>, commands: Receiver<RegistryComm
                     Err(e) => {
                         let _ = tx.send(RegistryEvent::Failed {
                             op: "setting",
+                            message: e.to_string(),
+                        });
+                    }
+                }
+            }
+            RegistryCommand::SetEnabled { id, on } => {
+                match aneural_registry::set_enabled(root, &id, on) {
+                    Ok(_) => {
+                        let _ = tx.send(RegistryEvent::EnabledSaved { id, on });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(RegistryEvent::Failed {
+                            op: "enable",
                             message: e.to_string(),
                         });
                     }

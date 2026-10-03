@@ -8,6 +8,7 @@ use crate::picking::{Hovered, Selection};
 use crate::theme;
 use crate::workspace::{WorkspaceRes, node_radius};
 use aneural_core::Node;
+use aneural_core::kinds::EdgeKind;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::entity::EntityHashSet;
@@ -81,7 +82,7 @@ impl Plugin for RenderPlugin {
             .add_systems(
                 Update,
                 (
-                    (draw_spore_motes, draw_edges).chain(),
+                    (thin_hyphae, draw_spore_motes, draw_edges).chain(),
                     hidden_visibility,
                     label_visibility,
                     selection_ring,
@@ -112,10 +113,37 @@ pub struct Skeleton;
 #[derive(Default, Reflect, GizmoConfigGroup)]
 pub struct LitHyphae;
 
-/// Stroke widths in screen pixels, whatever the zoom.
+/// Stroke widths in screen pixels, close in. Pulled back over a whole
+/// monorepo the same strokes would merge into one lump of ink, so they thin
+/// and fade with the distance: see [`thinning`].
 const SKELETON_WIDTH: f32 = 2.4;
 const LINK_WIDTH: f32 = 1.0;
 const LIT_WIDTH: f32 = 2.0;
+/// The zoom at which strands start thinning, and the one past which they are
+/// as fine and faint as they go (world units per screen pixel).
+const THIN_FROM: f32 = 2.0;
+const THIN_TO: f32 = 24.0;
+/// What a strand is reduced to at [`THIN_TO`]: a little under half its width,
+/// and a little over half its ink.
+const THINNEST: f32 = 0.45;
+const FAINTEST: f32 = 0.42;
+
+/// How far the view has pulled back, 0 (close in) to 1 (a whole monorepo).
+fn thinning(zoom: f32) -> f32 {
+    ((zoom - THIN_FROM) / (THIN_TO - THIN_FROM)).clamp(0.0, 1.0)
+}
+
+/// Thin every stroke as the view pulls back. A separate system because the
+/// gizmos themselves hold the config store while they are being drawn.
+fn thin_hyphae(mut store: ResMut<GizmoConfigStore>, camera: Query<&Projection, With<MainCamera>>) {
+    let Ok(Projection::Orthographic(ortho)) = camera.single() else {
+        return;
+    };
+    let thinner = 1.0 - (1.0 - THINNEST) * thinning(ortho.scale.max(1e-3));
+    store.config_mut::<DefaultGizmoConfigGroup>().0.line.width = LINK_WIDTH * thinner;
+    store.config_mut::<Skeleton>().0.line.width = SKELETON_WIDTH * thinner;
+    store.config_mut::<LitHyphae>().0.line.width = LIT_WIDTH * thinner;
+}
 
 /// 2D gizmos are always queued last, whatever their depth, so the hyphae would
 /// paint over the nodes. Park them on render layers of their own, drawn by the
@@ -184,10 +212,35 @@ fn aim_spotlight(
     hovered: Res<Hovered>,
     graph: Res<GraphState>,
     filters: Res<crate::filters::Filters>,
+    review: Res<crate::review::Review>,
     nodes: Query<(Entity, &GraphNode, Has<Hidden>)>,
     edges: Query<&GraphEdge>,
 ) {
     use crate::filters::PointedKind;
+    // A plan open in the drawer outranks everything: the reader has asked, in
+    // as many words, to be shown this one thing. Pointing at a row in the
+    // Filters drawer still wins over hovering, and hovering over selection,
+    // as before.
+    if let Some(plan) = &review.plan {
+        let reading = crate::review::read(&graph, plan);
+        if !reading.is_empty() {
+            let keep: EntityHashSet = review
+                .lit(&reading)
+                .iter()
+                .filter_map(|id| graph.by_id.get(id).copied())
+                .collect();
+            let keep = Some(keep);
+            // `Between` rather than `Touching`: a plan's own threads are not
+            // strands, so what should light is the wiring *among* the files it
+            // reaches — which is the shape of the work it describes.
+            if spot.keep != keep || spot.hyphae != LitHyphaeRule::Between {
+                spot.keep = keep;
+                spot.hyphae = LitHyphaeRule::Between;
+                spot.moves += 1;
+            }
+            return;
+        }
+    }
     let (keep, hyphae) = match &filters.pointed {
         Some(PointedKind::Node(kind)) => (
             Some(
@@ -399,8 +452,11 @@ pub fn spawn_node_visuals(
             ChildOf(entity),
         ));
     }
+    // `...` and not `…`: the canvas font has no glyph for the ellipsis, so
+    // every label long enough to be cut — a quarter of them in a real
+    // workspace — ended in a tofu box.
     let label = if node.label.chars().count() > 28 {
-        format!("{}…", node.label.chars().take(27).collect::<String>())
+        format!("{}...", node.label.chars().take(27).collect::<String>())
     } else {
         node.label.clone()
     };
@@ -408,7 +464,7 @@ pub fn spawn_node_visuals(
         NodeLabel,
         Text2d(label),
         TextFont {
-            font_size: FontSize::Px(11.0),
+            font_size: FontSize::Px(LABEL_PX),
             ..default()
         },
         TextColor(palette.text),
@@ -576,6 +632,9 @@ fn draw_edges(
     // World units per screen pixel: what keeps the strands' width and their
     // sway the same size on screen however far the graph is zoomed out.
     let scale_px = ortho.scale.max(1e-3);
+    // Thousands of strands at full width are a wall of ink from far enough
+    // back, so the whole mesh is drawn finer the further out the view goes.
+    let fainter = 1.0 - (1.0 - FAINTEST) * thinning(scale_px);
     let palette = &vibe.palette;
     let night = palette.night;
     // After dark the whole mesh dims and lifts together with the breath, and
@@ -595,7 +654,14 @@ fn draw_edges(
         let structural = e.kind == "CONTAINS";
         // A relation is shown by where its node floats, not by a strand. Only
         // with one end in hand does a faint thread say exactly what to.
-        let relation = e.kind == "RELATES_TO";
+        //
+        // That covers two cases. Kinds that are never strands, and any edge
+        // hanging off a node that floats: a plan naming twenty-five files by
+        // name would otherwise fan twenty-five lines across the whole tree, the
+        // same hairball a commit makes, just in a different colour.
+        let relation = !EdgeKind::is_strand(&e.kind)
+            || graph.floats_entity(e.src)
+            || graph.floats_entity(e.dst);
         if relation && !lit {
             continue;
         }
@@ -645,7 +711,8 @@ fn draw_edges(
             (false, true, false) => GHOST,
             (false, false, true) => 0.55,
             (false, false, false) => 0.22,
-        } * swell;
+        } * swell
+            * if lit { 1.0 } else { fainter };
         let mut strokes = Vec::with_capacity(3);
         // The glow doubles a hypha's ink, so it is spent only on the thread
         // the user is actually looking at.
@@ -813,9 +880,17 @@ fn night_chrome(
 
 /// The halo behind each node: dark and hidden by day, and after dark a glow
 /// that swells and settles on the breath rippling out across the graph.
+///
+/// With one exception, and it is deliberate: a node something is **happening
+/// to** is lit at noon as well. Activity is information, not atmosphere, and
+/// the same exception is already made for the nodes that float rather than sit
+/// in the tree. It costs a daylit workspace the per-frame pass this system
+/// already runs every frame after dark, and only for as long as anything is
+/// still warm.
 fn breathe_halos(
     vibe: Res<Vibe>,
     positions: Query<&Pos>,
+    warm: Query<&crate::live::Live>,
     mut halos: Query<(
         &ChildOf,
         &GlowHalo,
@@ -826,7 +901,7 @@ fn breathe_halos(
     mut lit: Local<bool>,
 ) {
     let night = vibe.palette.night;
-    if night < 0.02 {
+    if night < 0.02 && warm.is_empty() {
         if !*lit {
             return;
         }
@@ -848,11 +923,16 @@ fn breathe_halos(
             .map(|p| p.0)
             .unwrap_or_default();
         let breath = vibe.breath_at(at);
-        sprite.color = vibe
-            .palette
-            .bioluminesce(halo.0)
-            .with_alpha(night * (0.30 + 0.13 * breath));
-        transform.scale = Vec3::splat(1.0 + 0.07 * night * breath);
+        let heat = warm.get(parent.parent()).map(|l| l.0).unwrap_or(0.0);
+        // Heat is added rather than blended in, so a live node after dark is
+        // brighter than the graph around it and not merely differently lit.
+        // It also swells: at noon there is no glow anywhere else to compare it
+        // against, and a halo the size of the node it sits behind is not
+        // something anyone catches out of the corner of an eye.
+        let glow = night * (0.30 + 0.13 * breath) + heat * 0.70 * (0.78 + 0.22 * breath);
+        sprite.color = vibe.palette.bioluminesce(halo.0).with_alpha(glow.min(0.95));
+        transform.scale =
+            Vec3::splat(1.0 + 0.07 * night * breath + 0.45 * heat * (0.8 + 0.2 * breath));
     }
 }
 
@@ -877,13 +957,32 @@ fn hidden_visibility(mut nodes: Query<(&mut Visibility, Has<Hidden>), With<Graph
     }
 }
 
+/// A label's height in world units, whatever the camera is doing.
+const LABEL_PX: f32 = 11.0;
+
+/// The largest a label is ever baked at. Past this the atlas costs more than
+/// the sharpness is worth, and no zoom the camera allows gets there anyway.
+const MAX_LABEL_PX: f32 = 96.0;
+
+/// The font size to bake a label at for the `want` pixels it covers on screen.
+/// Sizes climb in quarter-octave steps, so a pinch rebakes every label a
+/// handful of times instead of once a frame, and always round up: a name drawn
+/// smaller than it was baked stays sharp, one drawn larger is the blur this is
+/// here to avoid.
+fn label_bake_px(want: f32) -> f32 {
+    let step = (want.max(LABEL_PX).log2() * 4.0).ceil() / 4.0;
+    step.exp2().min(MAX_LABEL_PX)
+}
+
 fn label_visibility(
     camera: Query<&Projection, With<MainCamera>>,
     ws: Res<WorkspaceRes>,
     nodes: Query<(Entity, &Children, Has<Hidden>), With<GraphNode>>,
-    mut labels: Query<&mut Visibility, With<NodeLabel>>,
+    mut labels: Query<(&mut Visibility, &mut Transform, &mut TextFont), With<NodeLabel>>,
     selection: Res<Selection>,
     hovered: Res<Hovered>,
+    review: Res<crate::review::Review>,
+    named: Res<crate::live::Named>,
     graph: Res<crate::graph::GraphState>,
 ) {
     let Ok(Projection::Orthographic(ortho)) = camera.single() else {
@@ -900,16 +999,54 @@ fn label_visibility(
         .as_ref()
         .and_then(|id| graph.by_id.get(id))
         .copied();
+    // The files of a step being walked are named whatever the zoom: a step is
+    // a handful of nodes the reader was just sent to, and sending someone to
+    // anonymous dots is most of what made the plan view unreadable.
+    let walked: EntityHashSet = review
+        .step_files()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|id| graph.by_id.get(id).copied())
+                .collect()
+        })
+        .unwrap_or_default();
+    // A label is drawn in the world, so it shrinks as the camera pulls back.
+    // A step whose files sit at opposite ends of the repo has to be framed
+    // from far away, and a name too small to read is the same as no name at
+    // all — so the ones the walk forces are scaled back up to the size they
+    // would have had at the threshold.
+    let legible = (ortho.scale / ws.config.gui.label_zoom_threshold).max(1.0);
     for (entity, children, hidden) in &nodes {
-        let forced = selected == Some(entity) || hovered == Some(entity);
+        let walking = walked.contains(&entity);
+        // A node something is happening to is named too, but *not* grown: its
+        // name is read inside a portal, which frames it from close up, and the
+        // up-scaling below would fill that little window with one word.
+        let forced = selected == Some(entity)
+            || hovered == Some(entity)
+            || walking
+            || named.0.contains(&entity);
         for c in children.iter() {
-            if let Ok(mut v) = labels.get_mut(c) {
+            if let Ok((mut v, mut t, mut font)) = labels.get_mut(c) {
                 let want = !hidden && (show || forced);
                 *v = if want {
                     Visibility::Inherited
                 } else {
                     Visibility::Hidden
                 };
+                let grown = if walking { legible } else { 1.0 };
+                // Glyphs are baked into an atlas once, at their font size, and
+                // the camera only stretches that picture — so a name read from
+                // up close has to be baked bigger. How big it lands on screen
+                // is how big it is in the world over the zoom.
+                let px = label_bake_px(LABEL_PX * grown / ortho.scale);
+                let scale = LABEL_PX * grown / px;
+                if t.scale.x != scale {
+                    t.scale = Vec3::splat(scale);
+                }
+                if !matches!(font.font_size, FontSize::Px(p) if p == px) {
+                    font.font_size = FontSize::Px(px);
+                }
             }
         }
     }
@@ -1001,6 +1138,7 @@ mod tests {
             src,
             dst,
             seed: 0,
+            props: serde_json::Value::Null,
         };
         let (ab, bc) = (edge("IMPORTS", a, b), edge("CONTAINS", b, c));
 

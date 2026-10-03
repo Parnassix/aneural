@@ -35,12 +35,34 @@ pub struct Entry {
     pub rel: String,
     pub is_dir: bool,
     pub is_repo: bool,
+    /// An Obsidian vault root. A directory can be this *and* a repo, which is
+    /// why it is a property rather than a kind.
+    pub is_vault: bool,
     pub size: u64,
     pub mtime: i64,
 }
 
 pub fn is_repo_root(dir: &Path) -> bool {
     dir.join(".git").exists()
+}
+
+/// Does this directory hold an Obsidian vault?
+///
+/// `.obsidian/` itself is UI state and holds no knowledge — the notes do. Its
+/// value is the one bit it carries: the markdown here is the subject matter
+/// rather than documentation about code.
+pub fn is_vault_root(dir: &Path) -> bool {
+    dir.join(".obsidian").is_dir()
+}
+
+/// Whether the vault's own graph view is set to hide unresolved links.
+///
+/// The only preference in `.obsidian/` that has an Aneural equivalent, and the
+/// user already answered it once.
+pub fn vault_hides_unresolved(dir: &Path) -> Option<bool> {
+    let text = std::fs::read_to_string(dir.join(".obsidian").join("graph.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("hideUnresolved")?.as_bool()
 }
 
 /// Build the ignore-aware walker for one root.
@@ -95,6 +117,7 @@ pub fn entry_for(ws: &Workspace, path: &Path) -> Option<Entry> {
         rel,
         is_dir: meta.is_dir(),
         is_repo: meta.is_dir() && is_repo_root(path),
+        is_vault: meta.is_dir() && is_vault_root(path),
         size: meta.len(),
         mtime,
     })
@@ -130,6 +153,12 @@ pub fn node_for(ws: &Workspace, config: &Config, entry: &Entry, repo: Option<&No
             .with_repo(repo.cloned());
         if entry.is_repo {
             n = n.with_prop("repo", true);
+        }
+        if entry.is_vault {
+            n = n.with_prop("vault", true);
+            if let Some(hide) = vault_hides_unresolved(&entry.abs) {
+                n = n.with_prop("hideUnresolvedLinks", hide);
+            }
         }
         n
     } else {
@@ -210,5 +239,45 @@ pub fn repo_for(rel: &str, repos: &std::collections::BTreeSet<String>) -> Option
             .rsplit_once('/')
             .map(|(p, _)| p.to_string())
             .unwrap_or_else(|| ".".to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_vault_is_recognised_and_can_also_be_a_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(!is_vault_root(dir));
+
+        std::fs::create_dir(dir.join(".obsidian")).unwrap();
+        assert!(is_vault_root(dir));
+        // Being a vault says nothing about being a repo, and a real vault is
+        // often both — which is why neither can be the directory's kind.
+        assert!(!is_repo_root(dir));
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        assert!(is_repo_root(dir) && is_vault_root(dir));
+    }
+
+    #[test]
+    fn the_vaults_own_unresolved_link_preference_is_read_when_it_has_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir(dir.join(".obsidian")).unwrap();
+        // No graph.json at all: no opinion to honour.
+        assert_eq!(vault_hides_unresolved(dir), None);
+
+        let graph = dir.join(".obsidian").join("graph.json");
+        std::fs::write(&graph, r#"{"hideUnresolved": true, "scale": 0.24}"#).unwrap();
+        assert_eq!(vault_hides_unresolved(dir), Some(true));
+
+        std::fs::write(&graph, r#"{"showTags": true}"#).unwrap();
+        assert_eq!(vault_hides_unresolved(dir), None, "absent, not false");
+
+        // Obsidian rewrites this file constantly; a torn write must not panic.
+        std::fs::write(&graph, "{not json").unwrap();
+        assert_eq!(vault_hides_unresolved(dir), None);
     }
 }

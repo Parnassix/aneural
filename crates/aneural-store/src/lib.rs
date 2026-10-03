@@ -18,7 +18,14 @@ use std::path::Path;
 /// Bump whenever what gets indexed changes shape, not just the tables: a cache
 /// from before is dropped and rebuilt rather than served stale.
 /// 2: RE_EXPORTS and DEPENDS_ON folded into IMPORTS, manifests no longer parsed.
-pub const USER_VERSION: i32 = 2;
+/// 3: Session and Commit nodes, MODIFIES and REALIZES edges, Plan became a
+///    builtin kind — an existing cache has none of them and cannot grow them
+///    without re-reading history.
+/// 4: Script, Schedule and Run became builtin kinds, and the `scripts` spore
+///    harvests the first two. An existing cache holds neither, and an unchanged
+///    file is replayed from cache rather than re-harvested, so without this the
+///    spore would find nothing until every file it matches happened to change.
+pub const USER_VERSION: i32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -198,6 +205,26 @@ impl Store {
             .optional()?)
     }
 
+    /// Forget one `meta` key. Used when the thing it tracked is gone — a
+    /// transcript that was deleted leaves no reason to remember how far it had
+    /// been read.
+    pub fn meta_delete(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Forget every `meta` key under a prefix, for when a whole producer is
+    /// switched off and the positions it remembered are meaningless.
+    pub fn meta_delete_prefix(&self, prefix: &str) -> Result<()> {
+        let like = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
+        self.conn.execute(
+            "DELETE FROM meta WHERE key LIKE ?1 ESCAPE '\\'",
+            params![like],
+        )?;
+        Ok(())
+    }
+
     pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -236,6 +263,51 @@ impl Store {
         upsert_edges_tx(&tx, &delta.edges)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Apply a delta and record `meta` keys in the same transaction.
+    ///
+    /// For a producer tailing an append-only file: the graph and the offset it
+    /// was read up to have to land together, or a crash between two commits
+    /// replays lines that were already applied.
+    pub fn apply_delta_with_meta(
+        &mut self,
+        delta: &GraphDelta,
+        meta: &[(&str, &str)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for e in &delta.removed_edges {
+            tx.execute(
+                "DELETE FROM edges WHERE kind = ?1 AND src = ?2 AND dst = ?3 AND source = ?4",
+                params![e.kind, e.src.as_str(), e.dst.as_str(), e.source],
+            )?;
+        }
+        delete_nodes_tx(&tx, &delta.removed_node_ids)?;
+        upsert_nodes_tx(&tx, &delta.nodes)?;
+        upsert_edges_tx(&tx, &delta.edges)?;
+        for (key, value) in meta {
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every distinct origin starting with `prefix`, e.g. `claude://`.
+    ///
+    /// A full index prunes by walking the filesystem, so nodes hanging off a
+    /// synthetic origin are invisible to it. This is how a producer finds the
+    /// origins it wrote last time and retracts the ones whose source is gone.
+    pub fn origins_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let like = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT origin FROM nodes WHERE origin LIKE ?1 ESCAPE '\\'
+             UNION SELECT DISTINCT origin FROM edges WHERE origin LIKE ?1 ESCAPE '\\'",
+        )?;
+        let rows = stmt.query_map([&like], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Replace everything previously produced from `origin` with the given
@@ -346,6 +418,91 @@ impl Store {
                 "SELECT n.id FROM nodes n WHERE n.kind = ?1 AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.dst = n.id)",
             )?;
             let rows = st.query_map(params![NodeKind::PACKAGE], |r| r.get::<_, String>(0))?;
+            rows.map(|r| r.map(NodeId::new))
+                .collect::<std::result::Result<_, _>>()?
+        };
+        if !ids.is_empty() {
+            self.delete_nodes(&ids)?;
+        }
+        Ok(ids)
+    }
+
+    /// Remove nodes of the given kinds that nothing points at any more.
+    ///
+    /// For nodes shared between files and therefore emitted with no origin —
+    /// an unresolved wiki-link placeholder is asked for by many notes and owned
+    /// by none — so `replace_origin` can never retract them. Same inbound-only
+    /// test as `gc_orphan_packages`, for the same reason: they are pointed at,
+    /// never outward.
+    pub fn gc_orphan_by_kind(&mut self, kinds: &[String]) -> Result<Vec<NodeId>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; kinds.len()].join(",");
+        let ids: Vec<NodeId> = {
+            let mut st = self.conn.prepare(&format!(
+                "SELECT n.id FROM nodes n
+                  WHERE n.kind IN ({placeholders}) AND n.origin IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.dst = n.id)"
+            ))?;
+            let rows =
+                st.query_map(rusqlite::params_from_iter(kinds), |r| r.get::<_, String>(0))?;
+            rows.map(|r| r.map(NodeId::new))
+                .collect::<std::result::Result<_, _>>()?
+        };
+        if !ids.is_empty() {
+            self.delete_nodes(&ids)?;
+        }
+        Ok(ids)
+    }
+
+    /// Of these ids, the derived nodes that belong to no single file.
+    ///
+    /// Replaying an unchanged file has to carry its shared nodes along with its
+    /// edges, or the edge arrives pointing at nothing. The walker's own
+    /// directories and files have no origin either, but the walk delivers those
+    /// itself, so they are not shared nodes and are left out.
+    pub fn shared_nodes(&self, ids: &[NodeId]) -> Result<Vec<Node>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let structural = [
+            NodeKind::DIRECTORY,
+            NodeKind::REPO,
+            NodeKind::FILE,
+            NodeKind::MANIFEST,
+        ];
+        let id_slots = vec!["?"; ids.len()].join(",");
+        let kind_slots = vec!["?"; structural.len()].join(",");
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {NODE_COLS} FROM nodes
+              WHERE origin IS NULL AND kind NOT IN ({kind_slots}) AND id IN ({id_slots})
+              ORDER BY id"
+        ))?;
+        let params = structural
+            .iter()
+            .copied()
+            .chain(ids.iter().map(NodeId::as_str));
+        let rows = st.query_map(rusqlite::params_from_iter(params), row_to_node)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Remove `Commit` and `Session` nodes with no edges left in either
+    /// direction — a commit that only touched files this workspace does not
+    /// index, or a session that never reached anything here.
+    ///
+    /// Note the rule is "no edges at all", not the inbound-only test
+    /// `gc_orphan_packages` uses: these nodes point *outward* at files, so an
+    /// inbound test would collect every one of them on sight.
+    pub fn gc_disconnected_history(&mut self) -> Result<Vec<NodeId>> {
+        let ids: Vec<NodeId> = {
+            let mut st = self.conn.prepare(
+                "SELECT n.id FROM nodes n WHERE n.kind IN (?1, ?2)
+                   AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.dst = n.id OR e.src = n.id)",
+            )?;
+            let rows = st.query_map(params![NodeKind::COMMIT, NodeKind::SESSION], |r| {
+                r.get::<_, String>(0)
+            })?;
             rows.map(|r| r.map(NodeId::new))
                 .collect::<std::result::Result<_, _>>()?
         };
@@ -791,6 +948,76 @@ mod tests {
         .with_path(p)
     }
 
+    #[test]
+    fn a_shared_placeholder_outlives_one_file_and_dies_with_the_last() {
+        let mut s = Store::open_in_memory().unwrap();
+        // Two notes, both linking to a note nobody has written. The placeholder
+        // belongs to neither, so it carries no origin.
+        let missing = Node::new(
+            NodeId::new("missing:not-written-yet"),
+            "MissingNote",
+            "Not Written Yet",
+            "spore:aneural.wiki-links",
+        );
+        let link = |from: &str| {
+            Edge::new(
+                EdgeKind::RELATES_TO,
+                NodeId::file(from),
+                NodeId::new("missing:not-written-yet"),
+                "spore:aneural.wiki-links",
+            )
+            .with_origin(from)
+        };
+
+        s.replace_origin("a.md", &[file("a.md"), missing.clone()], &[link("a.md")])
+            .unwrap();
+        s.replace_origin("b.md", &[file("b.md"), missing.clone()], &[link("b.md")])
+            .unwrap();
+        assert!(
+            s.get_node(&NodeId::new("missing:not-written-yet"))
+                .unwrap()
+                .is_some()
+        );
+
+        // Replaying an unchanged file has to carry the shared node with it, or
+        // the edge arrives pointing at nothing.
+        let shared = s
+            .shared_nodes(&[NodeId::new("missing:not-written-yet"), NodeId::file("a.md")])
+            .unwrap();
+        assert_eq!(
+            shared.len(),
+            1,
+            "the placeholder is shared; a.md is structural and the walk delivers it"
+        );
+        assert_eq!(shared[0].id, NodeId::new("missing:not-written-yet"));
+
+        let kinds = vec!["MissingNote".to_string()];
+
+        // a.md stops linking to it. b.md still does, so it stays.
+        s.replace_origin("a.md", &[file("a.md")], &[]).unwrap();
+        assert!(s.gc_orphan_by_kind(&kinds).unwrap().is_empty());
+        assert!(
+            s.get_node(&NodeId::new("missing:not-written-yet"))
+                .unwrap()
+                .is_some()
+        );
+
+        // The last link goes and it is collected.
+        s.replace_origin("b.md", &[file("b.md")], &[]).unwrap();
+        assert_eq!(
+            s.gc_orphan_by_kind(&kinds).unwrap(),
+            vec![NodeId::new("missing:not-written-yet")]
+        );
+        assert!(
+            s.get_node(&NodeId::new("missing:not-written-yet"))
+                .unwrap()
+                .is_none()
+        );
+        // Nothing to collect is not an error, and no kinds means no query.
+        assert!(s.gc_orphan_by_kind(&kinds).unwrap().is_empty());
+        assert!(s.gc_orphan_by_kind(&[]).unwrap().is_empty());
+    }
+
     fn seeded() -> Store {
         let mut s = Store::open_in_memory().unwrap();
         s.upsert_nodes(&[
@@ -1007,6 +1234,83 @@ mod tests {
             })
             .unwrap()
             .is_empty()
+        );
+    }
+
+    /// A commit points outward at the files it changed, so the inbound-only
+    /// rule that collects orphan packages would wrongly collect every commit.
+    #[test]
+    fn history_nodes_are_collected_only_when_nothing_is_left_of_them() {
+        let mut s = seeded();
+        let touched = Node::new(
+            NodeId::commit(".", "abc123"),
+            NodeKind::COMMIT,
+            "Grow the graph",
+            Source::GIT,
+        );
+        let stranded = Node::new(
+            NodeId::commit(".", "def456"),
+            NodeKind::COMMIT,
+            "Touched nothing we index",
+            Source::GIT,
+        );
+        let modifies = Edge::new(
+            EdgeKind::MODIFIES,
+            touched.id.clone(),
+            NodeId::file("src/a.ts"),
+            Source::GIT,
+        );
+        s.upsert_nodes(&[touched.clone(), stranded.clone()])
+            .unwrap();
+        s.upsert_edges(std::slice::from_ref(&modifies)).unwrap();
+
+        assert!(
+            s.gc_orphan_packages().unwrap().is_empty(),
+            "the package rule must not reach commits at all"
+        );
+        assert_eq!(s.gc_disconnected_history().unwrap(), vec![stranded.id]);
+        assert!(
+            s.get_node(&touched.id).unwrap().is_some(),
+            "a commit with an outgoing edge stays"
+        );
+    }
+
+    #[test]
+    fn origins_are_found_by_prefix_and_the_graph_lands_with_its_offset() {
+        let mut s = seeded();
+        let session = Node::new(
+            NodeId::session("uuid-1"),
+            NodeKind::SESSION,
+            "A session",
+            Source::CLAUDE,
+        )
+        .with_origin("claude://session/uuid-1");
+        let edge = Edge::new(
+            EdgeKind::MODIFIES,
+            session.id.clone(),
+            NodeId::file("src/a.ts"),
+            Source::CLAUDE,
+        )
+        .with_origin("claude://session/uuid-1");
+
+        let mut delta = GraphDelta::new(DeltaPhase::Live);
+        delta.nodes = vec![session.clone()];
+        delta.edges = vec![edge];
+        s.apply_delta_with_meta(&delta, &[("claude.tail.uuid-1", "{\"offset\":42}")])
+            .unwrap();
+
+        assert!(s.get_node(&session.id).unwrap().is_some());
+        assert_eq!(
+            s.meta_get("claude.tail.uuid-1").unwrap().as_deref(),
+            Some("{\"offset\":42}")
+        );
+        assert_eq!(
+            s.origins_with_prefix("claude://").unwrap(),
+            vec!["claude://session/uuid-1"]
+        );
+        assert!(
+            s.origins_with_prefix("git://").unwrap().is_empty(),
+            "a prefix that matches nothing finds nothing"
         );
     }
 
