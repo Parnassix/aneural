@@ -282,7 +282,7 @@ mod tests {
 
     /// Reads Aneural's own repository, which is the only fixture with real
     /// commits, real trailers and real renames in it. Skipped when the crate is
-    /// built from a tarball with no `.git`.
+    /// built from a tarball with no `.git`, and cut short in a shallow clone.
     #[test]
     fn this_repository_reads_back_whole() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -305,6 +305,18 @@ mod tests {
         assert!(head.at.starts_with("20"), "at is RFC 3339: {}", head.at);
         assert!(head.seconds > 0);
 
+        // The tree walk reports the directories it descended through as well as
+        // the blobs inside them, so `crates` would appear beside every file
+        // under it. Pinned against a commit whose real shape is known:
+        // `git show --name-only 4b0dae7` lists 21 paths, all of them files.
+        //
+        // Everything from here on needs real history, and a checkout does not
+        // always have it: CI clones one commit deep, and on a pull request that
+        // one commit is a merge GitHub made, with no trailer. A clone that
+        // cannot see the pinned commit has nothing to say about the rest.
+        let Some(mycelium) = log.iter().find(|c| c.sha.starts_with("4b0dae7750c05be7")) else {
+            return;
+        };
         assert!(
             log.iter().any(|c| c.session.is_some()),
             "this repository's commits carry Claude-Session trailers"
@@ -313,15 +325,6 @@ mod tests {
             log.iter().any(|c| !c.parents.is_empty()),
             "history is a chain, not a heap"
         );
-
-        // The tree walk reports the directories it descended through as well as
-        // the blobs inside them, so `crates` would appear beside every file
-        // under it. Pinned against a commit whose real shape is known:
-        // `git show --name-only 4b0dae7` lists 21 paths, all of them files.
-        let mycelium = log
-            .iter()
-            .find(|c| c.sha.starts_with("4b0dae7750c05be7"))
-            .expect("the mycelium commit is in the last 50");
         assert_eq!(
             mycelium.changed.len(),
             21,
