@@ -142,6 +142,12 @@ pub struct Engine {
     runs_db: Option<runs::store::RunStore>,
     /// What `launchctl list` last said, and when. See [`LAUNCHCTL_FLOOR`].
     last_loaded: Option<(Instant, BTreeMap<String, runs::launchd::Loaded>)>,
+    /// When the processes behind the running agents began, as `ps` last said,
+    /// and when it was asked. Under the same floor as `launchctl`.
+    last_starts: Option<(Instant, BTreeMap<u32, i64>)>,
+    /// What launchd and `ps` are to be taken as saying, set by a test. See
+    /// [`Engine::pin_launchd`].
+    pinned_launchd: Option<(BTreeMap<String, runs::launchd::Loaded>, BTreeMap<u32, i64>)>,
 }
 
 const BATCH: usize = 200;
@@ -200,6 +206,8 @@ impl Engine {
             history_is_hot: false,
             runs_db: None,
             last_loaded: None,
+            last_starts: None,
+            pinned_launchd: None,
         };
         engine.warm_from_store()?;
         Ok(engine)
@@ -637,23 +645,28 @@ impl Engine {
             // disk that launchd has never seen, and reporting one as "loaded"
             // because a label of the same name happens to be running elsewhere
             // would be a straight falsehood.
-            Some((dir, true)) => {
-                let fresh = self
-                    .last_loaded
-                    .as_ref()
-                    .is_none_or(|(at, _)| at.elapsed() >= LAUNCHCTL_FLOOR);
-                if fresh {
-                    self.last_loaded = Some((Instant::now(), runs::launchd::loaded()));
-                }
-                let loaded = self
-                    .last_loaded
-                    .as_ref()
-                    .map(|(_, l)| l.clone())
-                    .unwrap_or_default();
+            //
+            // A test pins what launchd says instead, and then the directory
+            // is whatever the test wrote.
+            Some((dir, real)) => {
+                let loaded = match (&self.pinned_launchd, real) {
+                    (Some((loaded, _)), _) => loaded.clone(),
+                    (None, true) => {
+                        let fresh = self
+                            .last_loaded
+                            .as_ref()
+                            .is_none_or(|(at, _)| at.elapsed() >= LAUNCHCTL_FLOOR);
+                        if fresh {
+                            self.last_loaded = Some((Instant::now(), runs::launchd::loaded()));
+                        }
+                        self.last_loaded
+                            .as_ref()
+                            .map(|(_, l)| l.clone())
+                            .unwrap_or_default()
+                    }
+                    (None, false) => Default::default(),
+                };
                 runs::launchd::installed(&dir, self.ws.root(), &loaded)
-            }
-            Some((dir, false)) => {
-                runs::launchd::installed(&dir, self.ws.root(), &Default::default())
             }
             None => Vec::new(),
         };
@@ -700,7 +713,14 @@ impl Engine {
         let keep_days = self.config.runs.keep_days;
         let keep_per_script = self.config.runs.keep_per_script;
         let attributes = self.ws.gitattributes_path();
-        let observed = runs::launchd::observe(installed, &machine);
+        // Only the pids worth dating: an agent with no script in this workspace
+        // never becomes a run, so its process is not asked about.
+        let pids: Vec<u32> = installed
+            .iter()
+            .filter(|a| a.script.is_some())
+            .filter_map(|a| a.pid)
+            .collect();
+        let starts = self.process_starts(&pids);
 
         let latest = {
             let db = match self.runs_db {
@@ -719,13 +739,22 @@ impl Engine {
                 tracing::debug!("run journal rewritten, re-read in full: {}", path.display());
             }
 
+            // Observed against the caught-up index, because an agent that is
+            // running is named by the run the index already has open for it.
+            let observed = runs::launchd::observe(installed, &machine, &starts, db)?;
+
             // Now only what the journal does not already hold. The id is derived
-            // from the instant observed, so re-observing an unchanged agent
+            // from what was observed, so re-observing an unchanged agent
             // produces the same id, and this is what turns that into "nothing to
-            // write" rather than "the same line again".
+            // write" rather than "the same line again". Compared by `seq` and
+            // not by id alone: the line that closes a running run has the id
+            // the index already holds, and is new all the same.
             let mut appended = false;
             for record in &observed {
-                if db.has(&record.run_id)? {
+                if db
+                    .seq_of(&record.run_id)?
+                    .is_some_and(|seq| seq >= record.seq)
+                {
                     continue;
                 }
                 aneural_core::workspace::write_gitattributes(&attributes)?;
@@ -786,6 +815,39 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Take `loaded` as what `launchctl list` says and `starts` as what `ps`
+    /// says about each pid in it, instead of asking either.
+    ///
+    /// For tests, which read launch agents from a directory they wrote and
+    /// must never fork to find out what is running: a pid in a fixture is a
+    /// story about a process, and the story has to include when it began.
+    pub fn pin_launchd(
+        &mut self,
+        loaded: BTreeMap<String, runs::launchd::Loaded>,
+        starts: BTreeMap<u32, i64>,
+    ) {
+        self.pinned_launchd = Some((loaded, starts));
+    }
+
+    /// When each of these processes began, asked of `ps` at most once per
+    /// [`LAUNCHCTL_FLOOR`] — sooner only for a pid it has not seen, which is
+    /// what a restart under `KeepAlive` looks like.
+    fn process_starts(&mut self, pids: &[u32]) -> BTreeMap<u32, i64> {
+        if let Some((_, starts)) = &self.pinned_launchd {
+            return starts.clone();
+        }
+        let stale = self.last_starts.as_ref().is_none_or(|(at, known)| {
+            at.elapsed() >= LAUNCHCTL_FLOOR || pids.iter().any(|p| !known.contains_key(p))
+        });
+        if stale {
+            self.last_starts = Some((Instant::now(), runs::launchd::process_starts(pids)));
+        }
+        self.last_starts
+            .as_ref()
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default()
     }
 
     /// Where to read launch agents from, and whether it is the directory launchd

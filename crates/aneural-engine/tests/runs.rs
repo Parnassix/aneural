@@ -126,6 +126,27 @@ fn index(ws: &Workspace) -> Engine {
     engine
 }
 
+/// 2026-09-15T00:00:00Z: when the fixture's process began, as `ps` would say.
+const STARTED: i64 = 1_789_430_400_000;
+const PID: u32 = 4242;
+
+/// Index with launchd pinned to a story about the agent: `pid` is what
+/// `launchctl list` shows for it, and the process behind `PID` began at
+/// `STARTED`. Nothing forks: the engine is told, never asks.
+fn index_with(ws: &Workspace, pid: Option<u32>, last_exit: Option<i64>) -> Engine {
+    let mut engine = Engine::open_in_memory(ws.clone()).unwrap();
+    engine.pin_launchd(
+        BTreeMap::from([(LABEL.to_string(), runs::launchd::Loaded { pid, last_exit })]),
+        BTreeMap::from([(PID, STARTED)]),
+    );
+    engine.index_full(false, &mut |_: EngineEvent| {}).unwrap();
+    engine
+}
+
+fn journal_lines(f: &Fixture) -> Vec<runs::journal::Record> {
+    runs::journal::read_from(&f.segment(), 0).unwrap().0
+}
+
 fn nodes_of_kind(engine: &Engine, kind: &str) -> Vec<Node> {
     let mut v = engine
         .store()
@@ -260,6 +281,73 @@ fn observing_the_same_unchanged_agent_again_appends_nothing() {
 
     index(&f.ws);
     assert_eq!(std::fs::read_to_string(f.segment()).unwrap(), after_first);
+}
+
+#[test]
+fn an_agent_that_is_running_is_one_run_however_often_it_is_looked_at() {
+    // A KeepAlive agent writes its log for as long as it lives, so the log's
+    // mtime is new on every tick. Keyed on the log, one such agent grew two
+    // hundred journal lines in a month; keyed on the process, three looks
+    // across a growing log are one line.
+    let f = fixture(true, true);
+    for i in 0..3 {
+        std::fs::write(
+            f.logs().join("pubmed_stderr.log"),
+            format!("fetched {} files\n", 412 + i),
+        )
+        .unwrap();
+        let engine = index_with(&f.ws, Some(PID), Some(0));
+        let runs = nodes_of_kind(&engine, NodeKind::RUN);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].prop_str("status"), Some("running"));
+        assert_eq!(
+            runs[0].prop_str("runId"),
+            Some(runs::journal::run_id(MACHINE, STARTED, SCRIPT).as_str())
+        );
+        assert_eq!(
+            runs[0].prop_str("startedAt"),
+            Some(runs::journal::rfc3339(STARTED).as_str())
+        );
+    }
+    let lines = journal_lines(&f);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+}
+
+#[test]
+fn when_the_process_goes_its_run_is_closed_under_the_same_id() {
+    let f = fixture(true, true);
+    index_with(&f.ws, Some(PID), None);
+    let opened = journal_lines(&f);
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].status, "running");
+
+    // The log keeps growing until the end, and launchd then reports the exit.
+    std::fs::write(
+        f.logs().join("pubmed_stderr.log"),
+        "fetched 412 files\ndone\n",
+    )
+    .unwrap();
+    let engine = index_with(&f.ws, None, Some(0));
+    let lines = journal_lines(&f);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(
+        lines[1].run_id, opened[0].run_id,
+        "the same run, not a new one"
+    );
+    assert_eq!(lines[1].started_at, opened[0].started_at);
+    assert_eq!(lines[1].seq, runs::launchd::CLOSED);
+    assert_eq!(lines[1].status, "ok");
+    assert_eq!(lines[1].err_bytes, Some(23), "sizes as of the finish");
+
+    let runs = nodes_of_kind(&engine, NodeKind::RUN);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].label, "download_pubmed: ok");
+    assert_eq!(runs[0].prop_str("runId"), Some(opened[0].run_id.as_str()));
+    assert!(runs[0].prop_str("endedAt").is_some());
+
+    // And looking again at the finished agent mints nothing from its log.
+    index_with(&f.ws, None, Some(0));
+    assert_eq!(journal_lines(&f).len(), 2);
 }
 
 #[test]

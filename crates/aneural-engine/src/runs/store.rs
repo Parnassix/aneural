@@ -213,6 +213,52 @@ impl RunStore {
             .is_some())
     }
 
+    /// How far along a run was when it was last seen: its stored `seq`, or
+    /// `None` for a run the index has never held.
+    ///
+    /// [`has`](Self::has) is enough for a one-shot observation, which is either
+    /// known or new. A run observed *while running* is different: its id is in
+    /// the index from the first look, and the line that closes it still has to
+    /// be written. The caller compares against this rather than asking "seen?".
+    pub fn seq_of(&self, run_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT seq FROM runs WHERE run_id = ?1", [run_id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?)
+    }
+
+    /// The newest run a schedule fired, whatever state it was last seen in.
+    pub fn latest_for_schedule(&self, schedule_id: &str) -> Result<Option<Record>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM runs WHERE schedule_id = ?1
+                 ORDER BY started_at DESC, run_id DESC LIMIT 1",
+                [schedule_id],
+                record_of,
+            )
+            .optional()?)
+    }
+
+    /// The run a schedule still has open: its newest run, when that run was
+    /// last seen `running`.
+    ///
+    /// What an observer asks before minting a run from a log file. An agent
+    /// whose pid has gone since the last look is the one this row was opened
+    /// for, and the finish belongs on this row rather than on a new one.
+    ///
+    /// Only the *newest* row qualifies. An older row left `running` behind a
+    /// newer one is history nothing can close any more — a journal written
+    /// before runs were keyed on the process has hundreds of them — and
+    /// reaching back for it would append a finish line per tick for each.
+    pub fn latest_running_for_schedule(&self, schedule_id: &str) -> Result<Option<Record>> {
+        Ok(self
+            .latest_for_schedule(schedule_id)?
+            .filter(|r| r.status == journal::status::RUNNING))
+    }
+
     /// The most recent run of each script.
     ///
     /// One row per script, which is what the graph shows: a node per run would
@@ -509,6 +555,57 @@ mod tests {
         assert_eq!(latest[0].script_key, "a.py");
         assert_eq!(latest[0].started_at, journal::rfc3339(MILLIS + 86_400_000));
         assert_eq!(store.history("a.py", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn only_the_newest_run_of_a_schedule_can_be_the_open_one() {
+        // A journal written before runs were keyed on the process holds a
+        // `running` line per tick. Reaching back past the newest row for any
+        // of them would close one per tick, forever.
+        let tmp = tempfile::tempdir().unwrap();
+        let schedule = "schedule:~/installed/com.example.extract";
+        let with_schedule = |millis, status| Record {
+            schedule_id: Some(schedule.into()),
+            ..record("mbp", "a.py", millis, 1, status)
+        };
+        journal::append(tmp.path(), &with_schedule(MILLIS, status::RUNNING)).unwrap();
+        journal::append(tmp.path(), &with_schedule(MILLIS + 1_000, status::RUNNING)).unwrap();
+        let (mut store, _) = ingested(tmp.path());
+
+        let open = store
+            .latest_running_for_schedule(schedule)
+            .unwrap()
+            .unwrap();
+        assert_eq!(open.started_at, journal::rfc3339(MILLIS + 1_000));
+        assert_eq!(store.seq_of(&open.run_id).unwrap(), Some(1));
+        assert_eq!(store.seq_of("mbp/0-nothing").unwrap(), None);
+
+        // Closed, and the older `running` row behind it is not next in line.
+        journal::append(
+            tmp.path(),
+            &Record {
+                seq: 2,
+                ..with_schedule(MILLIS + 1_000, status::OK)
+            },
+        )
+        .unwrap();
+        store.ingest(tmp.path()).unwrap();
+        assert!(
+            store
+                .latest_running_for_schedule(schedule)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.latest_for_schedule(schedule).unwrap().unwrap().status,
+            status::OK
+        );
+        assert!(
+            store
+                .latest_running_for_schedule("schedule:~/installed/other")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

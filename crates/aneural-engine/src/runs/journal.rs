@@ -466,9 +466,25 @@ pub fn rfc3339(millis: i64) -> String {
         .unwrap_or_default()
 }
 
+/// The unix-millisecond instant an [`rfc3339`] string names, or `None` for a
+/// string that is not one. The inverse, so a record read back from the journal
+/// can be placed against a fresh observation without comparing text.
+pub fn millis_of(rfc3339: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(rfc3339, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_instant_survives_the_round_trip_through_text() {
+        let millis = 1_758_000_000_123;
+        assert_eq!(millis_of(&rfc3339(millis)), Some(millis));
+        assert_eq!(millis_of("yesterday"), None);
+    }
 
     fn record(machine: &str, started: &str, script: &str, seq: i64, status: &str) -> Record {
         let millis = 1_758_000_000_000;
