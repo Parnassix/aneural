@@ -24,6 +24,13 @@
 //! process has a start time of its own, and that is what names it: `ps` gives
 //! it, the id holds still for as long as the process lives, and when the pid
 //! goes the same id gets its finish line.
+//!
+//! Two limits of that, known and accepted. A process that outlives
+//! `keep_days` has its journal segment retired while it is still running —
+//! retention is by month — and is minted again on the next tick as a new run.
+//! And a finish line that could not say when output was last seen (no log, or
+//! a log older than the process) is not recognised as having already closed
+//! the run, so the next look costs one extra log-dated line.
 
 use super::store::RunStore;
 use super::{Installed, journal};
@@ -238,18 +245,49 @@ fn parse_list(text: &str) -> BTreeMap<String, Loaded> {
 /// it is computed, and the whole point of the start time is that it holds still.
 #[cfg(target_os = "macos")]
 pub fn process_starts(pids: &[u32]) -> BTreeMap<u32, i64> {
-    if pids.is_empty() {
+    // One pid `ps` will not accept fails the whole call, dating nothing, so
+    // anything outside the range a pid can be is left out before asking.
+    let list: Vec<String> = pids
+        .iter()
+        .filter(|p| **p <= PID_MAX)
+        .map(|p| p.to_string())
+        .collect();
+    if list.is_empty() {
         return BTreeMap::new();
     }
-    let list: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
-    let Ok(out) = std::process::Command::new("ps")
+    let out = std::process::Command::new("ps")
         .args(["-o", "pid=,lstart=", "-p", &list.join(",")])
-        .output()
-    else {
-        return BTreeMap::new();
-    };
-    parse_starts(&String::from_utf8_lossy(&out.stdout), local_offset)
+        // `lstart` is `strftime("%c")`, which in any locale but C puts the
+        // day before the month, or translates the names, or both; the parser
+        // below reads one shape and this is how it is guaranteed to get it.
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            parse_starts(&String::from_utf8_lossy(&out.stdout), local_offset)
+        }
+        // Said rather than swallowed: undated, every running agent falls back
+        // to being named by its log, which is the churn this exists to stop.
+        Ok(out) => {
+            tracing::warn!(
+                "ps could not date pids {}: {}",
+                list.join(","),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            BTreeMap::new()
+        }
+        Err(e) => {
+            tracing::warn!("ps could not be run to date pids {}: {e}", list.join(","));
+            BTreeMap::new()
+        }
+    }
 }
+
+/// The largest pid macOS hands out (`PID_MAX` in the kernel). `ps` refuses a
+/// larger one outright rather than reporting it as not running.
+#[cfg(any(target_os = "macos", test))]
+const PID_MAX: u32 = 99_998;
 
 #[cfg(not(target_os = "macos"))]
 pub fn process_starts(_pids: &[u32]) -> BTreeMap<u32, i64> {
@@ -370,10 +408,17 @@ fn observed(
     let schedule_id = NodeId::installed_schedule(&agent.label)
         .as_str()
         .to_string();
-    let latest = store.latest_for_schedule(&schedule_id)?;
-    let open = latest
-        .clone()
-        .filter(|r| r.status == journal::status::RUNNING);
+    // Both this machine's: a schedule id is a label, and the merged journal
+    // holds the same label's runs from every machine that has it.
+    let latest = store.latest_for_schedule(&schedule_id, machine)?;
+    let mut open = store.running_for_schedule(&schedule_id, machine)?;
+    // The run this agent has open, if any: the `running` row seen last. Any
+    // others behind it are lines from before runs were keyed on the process,
+    // one per tick, and nothing will ever watch them end; they are closed
+    // here, all in the same look, so that after this look exactly one row
+    // per agent can be open and ranking the latest run never has to choose
+    // between two that both claim to be running.
+    let newest = (!open.is_empty()).then(|| open.remove(0));
 
     // Everything but the fields that say *which* run and *where it got to*.
     let seen = |millis: i64| journal::Record {
@@ -415,7 +460,10 @@ fn observed(
         ..seen(0)
     };
 
-    let mut records = Vec::new();
+    let mut records: Vec<journal::Record> = open
+        .iter()
+        .map(|stale| closed(stale, journal::status::UNKNOWN, None))
+        .collect();
     match (agent.pid, agent.pid.and_then(|p| starts.get(&p).copied())) {
         (Some(_), Some(start)) => {
             let running = journal::Record {
@@ -426,7 +474,7 @@ fn observed(
             // was a process launchd has since restarted, or a line from before
             // runs were keyed on the process; in neither case is how it ended
             // known, and `last_exit` may belong to it or to something older.
-            if let Some(prev) = open.as_ref().filter(|r| r.run_id != running.run_id) {
+            if let Some(prev) = newest.as_ref().filter(|r| r.run_id != running.run_id) {
                 records.push(closed(prev, journal::status::UNKNOWN, None));
             }
             records.push(running);
@@ -435,7 +483,7 @@ fn observed(
             // Alive, and `ps` could not date it. The run it already has open
             // is still its run; failing that, the log is the only date there
             // is, and the open row this mints is what the next tick finds.
-            match (open, log_millis) {
+            match (newest, log_millis) {
                 (Some(prev), _) => records.push(journal::Record {
                     run_id: prev.run_id.clone(),
                     started_at: prev.started_at.clone(),
@@ -451,7 +499,18 @@ fn observed(
         }
         (None, _) => {
             let status = ended(agent.last_exit);
-            if let Some(prev) = open {
+            if let Some(prev) = newest {
+                // What launchd says about the exit belongs to the run seen
+                // most recently. An open row behind a newer, closed one is a
+                // run nothing watched end — it came back from a journal
+                // rebuilt after it was pruned, or from a rewritten segment —
+                // and it is closed as such, not with an exit status borrowed
+                // from whatever ran after it.
+                let fresh = latest.as_ref().is_some_and(|r| r.run_id == prev.run_id);
+                if !fresh {
+                    records.push(closed(&prev, journal::status::UNKNOWN, None));
+                    return Ok(records);
+                }
                 let mut done = closed(&prev, status, agent.last_exit);
                 // When output was last seen, which is the nearest thing to an
                 // end an observer has — and only if that is after the start,
@@ -1017,8 +1076,27 @@ mod tests {
         // 2026-10-04T15:30:20-07:00 is 22:30:20Z
         assert_eq!(journal::rfc3339(starts[&90038]), "2026-10-04T22:30:20Z");
         assert_eq!(journal::rfc3339(starts[&1]), "2026-09-30T18:56:59Z");
-        // and nothing is asked when there is nothing to ask about
+        // and nothing is asked when there is nothing to ask about, nor about
+        // a pid `ps` would refuse and fail the whole call over
         assert!(process_starts(&[]).is_empty());
+        assert!(process_starts(&[PID_MAX + 1, 4_000_000]).is_empty());
+    }
+
+    #[test]
+    fn a_date_in_any_locale_but_c_is_not_read_which_is_why_c_is_forced() {
+        // `%c` under en_GB puts the day first and under de_DE translates the
+        // names too. Neither is a shape the parser knows, and silently reading
+        // nothing would leave every running agent named by its log again —
+        // so `ps` is run with `LC_ALL=C`, and this pins what that avoids.
+        let utc = |_: time::PrimitiveDateTime| time::UtcOffset::UTC;
+        assert!(parse_starts("    1 Wed 30 Sep 11:56:59 2026\n", utc).is_empty());
+        assert!(parse_starts("    1 Mi 30 Sep 11:56:59 2026\n", utc).is_empty());
+        assert!(parse_starts("    1 Mi. 30 Sep. 11:56:59 2026\n", utc).is_empty());
+        // the C shape, which is the one asked for
+        assert_eq!(
+            parse_starts("    1 Wed Sep 30 11:56:59 2026\n", utc)[&1],
+            journal::millis_of("2026-09-30T11:56:59Z").unwrap()
+        );
     }
 
     #[test]
@@ -1080,7 +1158,7 @@ mod tests {
         let running = agent(&text, &ws(), &alive).unwrap();
         tick(&journal_dir, &mut store, &[running], &starts);
         let open = store
-            .latest_running_for_schedule(NodeId::installed_schedule(&label).as_str())
+            .latest_running_for_schedule(NodeId::installed_schedule(&label).as_str(), "mbp")
             .unwrap();
         assert!(open.is_some(), "the run is open");
 
@@ -1174,6 +1252,160 @@ mod tests {
         // and only the newest row is ever open, so the old one stays closed
         tick(&journal_dir, &mut store, std::slice::from_ref(&a), &starts);
         assert_eq!(lines(&journal_dir).len(), 3);
+    }
+
+    #[test]
+    fn a_process_dated_run_is_closed_under_its_own_id_behind_a_newer_log_dated_one() {
+        // The sequence the first cut got wrong. A journal written before runs
+        // were keyed on the process holds a `running` line dated by the log,
+        // which is *later* than the process start `ps` reports. Ranked by
+        // start the process run is never the newest; ranked by observation
+        // it is, and it is the one the exit belongs to.
+        let tmp = tempfile::tempdir().unwrap();
+        let journal_dir = tmp.path().join("runs");
+        let mut store = RunStore::open_in_memory().unwrap();
+        let text = logged(tmp.path(), "out.log", "err.log");
+        std::fs::write(tmp.path().join("err.log"), "x\n").unwrap();
+        let label = "com.example.extract".to_string();
+        let script_key = "ingest/scripts/extract_summaries.py";
+        let started = 1_789_430_400_000;
+        let legacy = journal::Record {
+            run_id: journal::run_id("mbp", started + 3 * 86_400_000, script_key),
+            machine: "mbp".into(),
+            script_key: script_key.into(),
+            schedule_id: Some(NodeId::installed_schedule(&label).as_str().to_string()),
+            trigger: journal::trigger::LAUNCHD.into(),
+            started_at: journal::rfc3339(started + 3 * 86_400_000),
+            status: journal::status::RUNNING.into(),
+            fidelity: journal::fidelity::OBSERVED.into(),
+            seq: 1,
+            ..Default::default()
+        };
+        journal::append(&journal_dir, &legacy).unwrap();
+
+        let starts = BTreeMap::from([(4242, started)]);
+        let alive = BTreeMap::from([(
+            label.clone(),
+            Loaded {
+                pid: Some(4242),
+                last_exit: Some(0),
+            },
+        )]);
+        let a = agent(&text, &ws(), &alive).unwrap();
+        let seen = tick(&journal_dir, &mut store, std::slice::from_ref(&a), &starts);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].run_id, legacy.run_id);
+        assert_eq!(seen[0].status, journal::status::UNKNOWN);
+        let by_process = seen[1].run_id.clone();
+        assert_eq!(by_process, journal::run_id("mbp", started, script_key));
+        // another look while it runs adds nothing
+        tick(&journal_dir, &mut store, std::slice::from_ref(&a), &starts);
+        assert_eq!(lines(&journal_dir).len(), 3);
+        assert_eq!(store.latest_per_script().unwrap()[0].run_id, by_process);
+
+        let gone = BTreeMap::from([(
+            label.clone(),
+            Loaded {
+                pid: None,
+                last_exit: Some(0),
+            },
+        )]);
+        let exited = agent(&text, &ws(), &gone).unwrap();
+        let seen = tick(
+            &journal_dir,
+            &mut store,
+            std::slice::from_ref(&exited),
+            &starts,
+        );
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].run_id, by_process, "closed under its own id");
+        assert_eq!(seen[0].status, journal::status::OK);
+        assert_eq!(seen[0].seq, CLOSED);
+        let latest = store.latest_per_script().unwrap();
+        assert_eq!(latest[0].run_id, by_process);
+        assert_eq!(latest[0].status, journal::status::OK);
+        // and nothing is minted from the log afterwards
+        tick(
+            &journal_dir,
+            &mut store,
+            std::slice::from_ref(&exited),
+            &starts,
+        );
+        assert_eq!(lines(&journal_dir).len(), 4);
+        assert_eq!(store.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_run_left_open_behind_a_newer_one_is_closed_without_borrowing_its_exit() {
+        // Two `running` lines from before runs were keyed on the process, and
+        // the agent is not running. Every stale line is closed once, in the
+        // same look, and launchd's exit status goes to the run seen last.
+        let tmp = tempfile::tempdir().unwrap();
+        let journal_dir = tmp.path().join("runs");
+        let mut store = RunStore::open_in_memory().unwrap();
+        let text = logged(tmp.path(), "out.log", "err.log");
+        std::fs::write(tmp.path().join("err.log"), "x\n").unwrap();
+        let label = "com.example.extract".to_string();
+        let script_key = "ingest/scripts/extract_summaries.py";
+        let schedule_id = NodeId::installed_schedule(&label).as_str().to_string();
+        let started = 1_789_430_400_000;
+        for days in [1, 2] {
+            journal::append(
+                &journal_dir,
+                &journal::Record {
+                    run_id: journal::run_id("mbp", started + days * 86_400_000, script_key),
+                    machine: "mbp".into(),
+                    script_key: script_key.into(),
+                    schedule_id: Some(schedule_id.clone()),
+                    trigger: journal::trigger::LAUNCHD.into(),
+                    started_at: journal::rfc3339(started + days * 86_400_000),
+                    status: journal::status::RUNNING.into(),
+                    fidelity: journal::fidelity::OBSERVED.into(),
+                    seq: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let gone = BTreeMap::from([(
+            label,
+            Loaded {
+                pid: None,
+                last_exit: Some(0),
+            },
+        )]);
+        let a = agent(&text, &ws(), &gone).unwrap();
+        // Both closed in the one look. The line observed last is the run the
+        // exit belongs to; the one behind it is closed, but as unknown.
+        let seen = tick(
+            &journal_dir,
+            &mut store,
+            std::slice::from_ref(&a),
+            &BTreeMap::new(),
+        );
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].status, journal::status::UNKNOWN);
+        assert_eq!(seen[0].exit_code, None);
+        assert_eq!(seen[0].seq, CLOSED);
+        assert_eq!(
+            seen[0].run_id,
+            journal::run_id("mbp", started + 86_400_000, script_key)
+        );
+        assert_eq!(seen[1].status, journal::status::OK);
+        assert_eq!(seen[1].exit_code, Some(0));
+        assert_eq!(
+            seen[1].run_id,
+            journal::run_id("mbp", started + 2 * 86_400_000, script_key)
+        );
+        // and then nothing is left open to close
+        let seen = tick(
+            &journal_dir,
+            &mut store,
+            std::slice::from_ref(&a),
+            &BTreeMap::new(),
+        );
+        assert!(seen.is_empty(), "{seen:?}");
+        assert_eq!(lines(&journal_dir).len(), 4);
     }
 
     #[test]

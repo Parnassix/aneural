@@ -351,6 +351,102 @@ fn when_the_process_goes_its_run_is_closed_under_the_same_id() {
 }
 
 #[test]
+fn a_run_dated_by_its_process_is_closed_behind_a_newer_run_dated_by_its_log() {
+    // The live case: a journal from before runs were keyed on the process
+    // holds a `running` line dated by the log, three days *after* the start
+    // `ps` reports for the process that is still writing that log. The
+    // process run is the open one, and the one the exit belongs to.
+    let f = fixture(true, true);
+    let by_log = STARTED + 3 * 86_400_000;
+    let legacy = runs::journal::Record {
+        run_id: runs::journal::run_id(MACHINE, by_log, SCRIPT),
+        machine: MACHINE.into(),
+        script_key: SCRIPT.into(),
+        schedule_id: Some(NodeId::installed_schedule(LABEL).as_str().to_string()),
+        trigger: runs::journal::trigger::LAUNCHD.into(),
+        started_at: runs::journal::rfc3339(by_log),
+        status: runs::journal::status::RUNNING.into(),
+        fidelity: runs::journal::fidelity::OBSERVED.into(),
+        seq: 1,
+        ..Default::default()
+    };
+    runs::journal::append(&f.journal(), &legacy).unwrap();
+
+    let by_process = runs::journal::run_id(MACHINE, STARTED, SCRIPT);
+    for _ in 0..2 {
+        let engine = index_with(&f.ws, Some(PID), Some(0));
+        let runs = nodes_of_kind(&engine, NodeKind::RUN);
+        assert_eq!(runs[0].prop_str("runId"), Some(by_process.as_str()));
+        assert_eq!(runs[0].prop_str("status"), Some("running"));
+    }
+    let lines = journal_lines(&f);
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(
+        lines[1].run_id, legacy.run_id,
+        "the stale line is closed once"
+    );
+    assert_eq!(lines[1].status, "unknown");
+    assert_eq!(lines[2].run_id, by_process);
+
+    let engine = index_with(&f.ws, None, Some(0));
+    let lines = journal_lines(&f);
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(lines[3].run_id, by_process, "closed under its own id");
+    assert_eq!(lines[3].status, "ok");
+    assert_eq!(lines[3].seq, runs::launchd::CLOSED);
+    let runs = nodes_of_kind(&engine, NodeKind::RUN);
+    assert_eq!(runs[0].label, "download_pubmed: ok");
+    assert_eq!(runs[0].prop_str("runId"), Some(by_process.as_str()));
+
+    index_with(&f.ws, None, Some(0));
+    assert_eq!(journal_lines(&f).len(), 4, "nothing minted from the log");
+}
+
+#[test]
+fn another_machines_open_run_is_never_closed_by_this_one() {
+    // The same label on another machine is the same schedule id, and its
+    // journal arrives here by `git pull`. Their run is theirs to finish.
+    let f = fixture(true, true);
+    index(&f.ws);
+    let theirs = runs::journal::Record {
+        run_id: runs::journal::run_id("build-box", STARTED, SCRIPT),
+        machine: "build-box".into(),
+        script_key: SCRIPT.into(),
+        schedule_id: Some(NodeId::installed_schedule(LABEL).as_str().to_string()),
+        trigger: runs::journal::trigger::LAUNCHD.into(),
+        started_at: runs::journal::rfc3339(STARTED),
+        status: runs::journal::status::RUNNING.into(),
+        fidelity: runs::journal::fidelity::OBSERVED.into(),
+        seq: 1,
+        ..Default::default()
+    };
+    let their_segment = runs::journal::append(&f.journal(), &theirs).unwrap();
+    let ours = runs::journal::segments(&f.journal())
+        .into_iter()
+        .find(|p| p.starts_with(f.ws.runs_dir().join(MACHINE)))
+        .unwrap();
+    let ours_before = std::fs::read_to_string(&ours).unwrap();
+
+    // Here the agent is not running and launchd reports a clean exit — and
+    // that exit is not theirs.
+    let engine = index_with(&f.ws, None, Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&their_segment)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "nothing written to their directory"
+    );
+    assert_eq!(std::fs::read_to_string(&ours).unwrap(), ours_before);
+    drop(engine);
+    let index = runs::store::RunStore::open(&f.ws.runs_db_path()).unwrap();
+    let history = index.history(SCRIPT, 10).unwrap();
+    let still_open = history.iter().find(|r| r.run_id == theirs.run_id).unwrap();
+    assert_eq!(still_open.status, "running");
+}
+
+#[test]
 fn a_run_survives_losing_both_caches() {
     // The point of the journal. The graph store is dropped and rebuilt whenever
     // its version changes, and the run index is a cache of the journal — so

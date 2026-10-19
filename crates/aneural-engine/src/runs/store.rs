@@ -229,34 +229,63 @@ impl RunStore {
             .optional()?)
     }
 
-    /// The newest run a schedule fired, whatever state it was last seen in.
-    pub fn latest_for_schedule(&self, schedule_id: &str) -> Result<Option<Record>> {
+    /// The run of a schedule this machine observed most recently, whatever
+    /// state it was last seen in.
+    ///
+    /// Most recently *observed*, which is the order lines were appended in and
+    /// so the order they were ingested in — `rowid`, which an upsert's update
+    /// leaves where it was. Not `started_at`: a run dated by its process began
+    /// before any run dated by the log it writes, so by start time the process
+    /// run is never the newest, however many ticks after the log-dated one it
+    /// was seen.
+    ///
+    /// This machine's only. The journal is merged across machines and a
+    /// schedule id names a label, not a label on a machine, so without the
+    /// filter one machine would be closing another's runs with its own exit
+    /// status.
+    pub fn latest_for_schedule(&self, schedule_id: &str, machine: &str) -> Result<Option<Record>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT * FROM runs WHERE schedule_id = ?1
-                 ORDER BY started_at DESC, run_id DESC LIMIT 1",
-                [schedule_id],
+                "SELECT * FROM runs WHERE schedule_id = ?1 AND machine = ?2
+                 ORDER BY rowid DESC LIMIT 1",
+                [schedule_id, machine],
                 record_of,
             )
             .optional()?)
     }
 
-    /// The run a schedule still has open: its newest run, when that run was
-    /// last seen `running`.
+    /// Every run of a schedule this machine still has open, the one observed
+    /// most recently first — the same order as
+    /// [`latest_for_schedule`](Self::latest_for_schedule).
     ///
     /// What an observer asks before minting a run from a log file. An agent
-    /// whose pid has gone since the last look is the one this row was opened
-    /// for, and the finish belongs on this row rather than on a new one.
-    ///
-    /// Only the *newest* row qualifies. An older row left `running` behind a
-    /// newer one is history nothing can close any more — a journal written
-    /// before runs were keyed on the process has hundreds of them — and
-    /// reaching back for it would append a finish line per tick for each.
-    pub fn latest_running_for_schedule(&self, schedule_id: &str) -> Result<Option<Record>> {
+    /// whose pid has gone since the last look is the one the first of these
+    /// was opened for, and the finish belongs on that row rather than on a
+    /// new one. There should never be more than one; a journal written before
+    /// runs were keyed on the process has a `running` line per tick, and the
+    /// rest of the list is those, handed over so they can all be closed in
+    /// the same look — a bounded cost, paid once, for leaving no row open.
+    pub fn running_for_schedule(&self, schedule_id: &str, machine: &str) -> Result<Vec<Record>> {
+        let mut st = self.conn.prepare(
+            "SELECT * FROM runs WHERE schedule_id = ?1 AND machine = ?2 AND status = ?3
+             ORDER BY rowid DESC",
+        )?;
+        let rows = st.query_map([schedule_id, machine, journal::status::RUNNING], record_of)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The first of [`running_for_schedule`](Self::running_for_schedule): the
+    /// open run the next finish line belongs to.
+    pub fn latest_running_for_schedule(
+        &self,
+        schedule_id: &str,
+        machine: &str,
+    ) -> Result<Option<Record>> {
         Ok(self
-            .latest_for_schedule(schedule_id)?
-            .filter(|r| r.status == journal::status::RUNNING))
+            .running_for_schedule(schedule_id, machine)?
+            .into_iter()
+            .next())
     }
 
     /// The most recent run of each script.
@@ -265,12 +294,13 @@ impl RunStore {
     /// churn an entity every time a schedule fired, and the durable history is
     /// the journal.
     pub fn latest_per_script(&self) -> Result<Vec<Record>> {
-        let mut st = self.conn.prepare(
-            "SELECT * FROM runs WHERE run_id = (
-               SELECT x.run_id FROM runs AS x WHERE x.script_key = runs.script_key
-               ORDER BY x.started_at DESC, x.run_id DESC LIMIT 1
-             ) ORDER BY script_key",
-        )?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT * FROM (
+               SELECT *, ROW_NUMBER() OVER (PARTITION BY script_key ORDER BY {}) AS rn
+               FROM runs
+             ) WHERE rn = 1 ORDER BY script_key",
+            rank()
+        ))?;
         let rows = st.query_map([], record_of)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -301,16 +331,35 @@ impl RunStore {
             return Ok(0);
         }
         Ok(self.conn.execute(
-            "DELETE FROM runs WHERE run_id IN (
-               SELECT run_id FROM (
-                 SELECT run_id, ROW_NUMBER() OVER (
-                   PARTITION BY script_key ORDER BY started_at DESC, run_id DESC
-                 ) AS rn FROM runs
-               ) WHERE rn > ?1
-             )",
+            &format!(
+                "DELETE FROM runs WHERE run_id IN (
+                   SELECT run_id FROM (
+                     SELECT run_id, ROW_NUMBER() OVER (PARTITION BY script_key ORDER BY {}) AS rn
+                     FROM runs
+                   ) WHERE rn > ?1
+                 )",
+                rank()
+            ),
             [keep_per_script],
         )?)
     }
+}
+
+/// How a script's runs rank, newest first, for choosing the one to show and
+/// the ones to keep. One expression for both, so what is shown can never be
+/// what was just pruned.
+///
+/// A run still `running` is the latest by definition, whenever it began:
+/// a run dated by its process started before any run dated by the log it is
+/// still writing to, and ranked by start alone it would sit behind them — and
+/// be pruned behind them, and re-appended on the next tick. The rest rank by
+/// when they were last seen, which is the finish when one was recorded and
+/// the start otherwise.
+fn rank() -> String {
+    format!(
+        "(status = '{}') DESC, COALESCE(ended_at, started_at) DESC, run_id DESC",
+        journal::status::RUNNING
+    )
 }
 
 fn upsert(tx: &Connection, r: &Record, segment: &str) -> rusqlite::Result<()> {
@@ -558,54 +607,136 @@ mod tests {
     }
 
     #[test]
-    fn only_the_newest_run_of_a_schedule_can_be_the_open_one() {
-        // A journal written before runs were keyed on the process holds a
-        // `running` line per tick. Reaching back past the newest row for any
-        // of them would close one per tick, forever.
+    fn the_open_run_is_the_one_observed_last_not_the_one_that_began_last() {
+        // A run dated by its process began before the log-dated run seen on
+        // the tick before it. By start time it would never be the newest; by
+        // observation it is, and that is what has to be closed when the
+        // process goes.
         let tmp = tempfile::tempdir().unwrap();
         let schedule = "schedule:~/installed/com.example.extract";
         let with_schedule = |millis, status| Record {
             schedule_id: Some(schedule.into()),
             ..record("mbp", "a.py", millis, 1, status)
         };
-        journal::append(tmp.path(), &with_schedule(MILLIS, status::RUNNING)).unwrap();
-        journal::append(tmp.path(), &with_schedule(MILLIS + 1_000, status::RUNNING)).unwrap();
+        let by_log = with_schedule(MILLIS + 86_400_000, status::RUNNING);
+        let by_process = with_schedule(MILLIS, status::RUNNING);
+        journal::append(tmp.path(), &by_log).unwrap();
+        journal::append(tmp.path(), &by_process).unwrap();
         let (mut store, _) = ingested(tmp.path());
 
-        let open = store
-            .latest_running_for_schedule(schedule)
-            .unwrap()
-            .unwrap();
-        assert_eq!(open.started_at, journal::rfc3339(MILLIS + 1_000));
-        assert_eq!(store.seq_of(&open.run_id).unwrap(), Some(1));
+        let open = store.running_for_schedule(schedule, "mbp").unwrap();
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].run_id, by_process.run_id, "seen last, began first");
+        assert_eq!(open[1].run_id, by_log.run_id, "and the stale one behind it");
+        assert_eq!(store.seq_of(&open[0].run_id).unwrap(), Some(1));
         assert_eq!(store.seq_of("mbp/0-nothing").unwrap(), None);
 
-        // Closed, and the older `running` row behind it is not next in line.
+        // The stale one closed, as the same look would do.
         journal::append(
             tmp.path(),
             &Record {
                 seq: 2,
-                ..with_schedule(MILLIS + 1_000, status::OK)
+                ..with_schedule(MILLIS + 86_400_000, status::UNKNOWN)
             },
         )
         .unwrap();
         store.ingest(tmp.path()).unwrap();
-        assert!(
-            store
-                .latest_running_for_schedule(schedule)
-                .unwrap()
-                .is_none()
-        );
+        // The process run is the script's latest while it runs, whatever it
+        // is dated — and the one retention keeps.
         assert_eq!(
-            store.latest_for_schedule(schedule).unwrap().unwrap().status,
+            store.latest_per_script().unwrap()[0].run_id,
+            by_process.run_id
+        );
+        assert_eq!(store.prune(1).unwrap(), 1);
+        assert_eq!(
+            store.latest_per_script().unwrap()[0].run_id,
+            by_process.run_id
+        );
+
+        // Closed under its own id: the update leaves it where it was
+        // observed, so it is still the latest, and nothing is left open.
+        journal::append(
+            tmp.path(),
+            &Record {
+                seq: 2,
+                ended_at: Some(journal::rfc3339(MILLIS + 2 * 86_400_000)),
+                ..with_schedule(MILLIS, status::OK)
+            },
+        )
+        .unwrap();
+        store.ingest(tmp.path()).unwrap();
+        assert_eq!(
+            store
+                .latest_for_schedule(schedule, "mbp")
+                .unwrap()
+                .unwrap()
+                .status,
             status::OK
         );
         assert!(
             store
-                .latest_running_for_schedule("schedule:~/installed/other")
+                .latest_running_for_schedule(schedule, "mbp")
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(store.latest_per_script().unwrap()[0].status, status::OK);
+    }
+
+    #[test]
+    fn another_machines_open_run_is_not_this_machines_to_close() {
+        // The same label on two machines is the same schedule id, and the
+        // journal is merged across them.
+        let tmp = tempfile::tempdir().unwrap();
+        let schedule = "schedule:~/installed/com.example.extract";
+        let theirs = Record {
+            schedule_id: Some(schedule.into()),
+            ..record("build-box", "a.py", MILLIS + 1_000, 1, status::RUNNING)
+        };
+        journal::append(tmp.path(), &theirs).unwrap();
+        let (store, _) = ingested(tmp.path());
+        assert!(
+            store
+                .latest_running_for_schedule(schedule, "mbp")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .latest_for_schedule(schedule, "mbp")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .latest_running_for_schedule(schedule, "build-box")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_running_run_is_the_latest_and_is_never_pruned_whenever_it_began() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 1..=3 {
+            journal::append(
+                tmp.path(),
+                &record("mbp", "a.py", MILLIS + i * 86_400_000, 1, status::OK),
+            )
+            .unwrap();
+        }
+        journal::append(
+            tmp.path(),
+            &record("mbp", "a.py", MILLIS, 1, status::RUNNING),
+        )
+        .unwrap();
+        let (mut store, _) = ingested(tmp.path());
+        assert_eq!(
+            store.latest_per_script().unwrap()[0].status,
+            status::RUNNING
+        );
+        assert_eq!(store.prune(2).unwrap(), 2);
+        let kept = store.history("a.py", 10).unwrap();
+        assert!(kept.iter().any(|r| r.status == status::RUNNING), "{kept:?}");
     }
 
     #[test]
